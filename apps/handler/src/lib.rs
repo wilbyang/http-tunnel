@@ -225,7 +225,7 @@ pub async fn lookup_connection_by_tunnel_id(
     tunnel_id: &str,
 ) -> Result<String> {
     let table_name = env::get_connections_table_name()?;
-    let index_name = "tunnel-id-index";
+    let index_name = env::get_tunnel_id_index_name();
 
     let result = client
         .query()

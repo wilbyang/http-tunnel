@@ -7,6 +7,9 @@
 
 use anyhow::{Context, Result};
 
+/// Default GSI index name for tunnel ID lookups
+const DEFAULT_TUNNEL_ID_INDEX_NAME: &str = "tunnelId-index";
+
 /// Get the connections table name from environment variables.
 ///
 /// Tries the new RGD auto-injected name first (DYNAMODB_TABLE0_NAME),
@@ -45,6 +48,15 @@ pub fn get_pending_requests_table_name_or_default(default: &str) -> String {
     std::env::var("DYNAMODB_TABLE1_NAME")
         .or_else(|_| std::env::var("PENDING_REQUESTS_TABLE_NAME"))
         .unwrap_or_else(|_| default.to_string())
+}
+
+/// Get the tunnel ID GSI index name from environment variables.
+///
+/// Tries TUNNEL_ID_INDEX_NAME first, then falls back to the default "tunnelId-index".
+/// This allows the infrastructure to configure the GSI name dynamically.
+pub fn get_tunnel_id_index_name() -> String {
+    std::env::var("TUNNEL_ID_INDEX_NAME")
+        .unwrap_or_else(|_| DEFAULT_TUNNEL_ID_INDEX_NAME.to_string())
 }
 
 #[cfg(test)]
