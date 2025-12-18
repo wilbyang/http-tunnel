@@ -18,7 +18,7 @@ use http_tunnel_handler::handlers::{
 use http_tunnel_handler::http_api::HttpApiRequest;
 use lambda_runtime::{Error, LambdaEvent, run, service_fn};
 use serde_json::Value;
-use tracing::info;
+use tracing::{debug, info};
 
 /// Event types that the unified handler can process
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +120,13 @@ async fn function_handler(
         }
         EventType::HttpApi => {
             // Parse as HTTP API event (supports both v1 and v2 formats)
+            // Log the raw event for debugging payload format issues
+            debug!(
+                "HTTP API raw event: {}",
+                serde_json::to_string(&event.payload)
+                    .unwrap_or_else(|_| "failed to serialize".to_string())
+            );
+
             let http_request = HttpApiRequest::from_value(event.payload)
                 .map_err(|e| format!("Failed to parse HTTP API event: {}", e))?;
 

@@ -22,19 +22,19 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 # HTTP types
-http = "1.3"
+http = "1.4"
 
 # AWS Lambda
-lambda_runtime = "0.14"
-aws_lambda_events = { version = "0.18", default-features = true, features = [
+lambda_runtime = "1"
+aws_lambda_events = { version = "1", default-features = true, features = [
   "dynamodb",
 ] }
 
 # AWS SDK
 aws-config = { version = "1.8", features = ["behavior-version-latest"] }
-aws-sdk-dynamodb = "1.96"
-aws-sdk-apigatewaymanagement = "1.87"
-aws-sdk-eventbridge = "1.94"
+aws-sdk-dynamodb = "1.101"
+aws-sdk-apigatewaymanagement = "1.91"
+aws-sdk-eventbridge = "1.98"
 
 # Logging
 tracing = "0.1"

@@ -22,13 +22,10 @@ pub async fn handle_connect(
     if let Err(e) = auth::authenticate_request(&event.payload) {
         use aws_lambda_events::encodings::Body;
         error!("Authentication failed: {}", e);
-        return Ok(ApiGatewayProxyResponse {
-            status_code: 401,
-            headers: Default::default(),
-            multi_value_headers: Default::default(),
-            body: Some(Body::Text("Unauthorized".to_string())),
-            is_base64_encoded: false,
-        });
+        let mut response = ApiGatewayProxyResponse::default();
+        response.status_code = 401;
+        response.body = Some(Body::Text("Unauthorized".to_string()));
+        return Ok(response);
     }
 
     let request_context = event.payload.request_context;
@@ -98,13 +95,9 @@ pub async fn handle_connect(
 
     // Return success response
     // Note: Forwarder will send Ready message to get connection info
-    Ok(ApiGatewayProxyResponse {
-        status_code: 200,
-        headers: Default::default(),
-        multi_value_headers: Default::default(),
-        body: None,
-        is_base64_encoded: false,
-    })
+    let mut response = ApiGatewayProxyResponse::default();
+    response.status_code = 200;
+    Ok(response)
 }
 
 #[cfg(test)]

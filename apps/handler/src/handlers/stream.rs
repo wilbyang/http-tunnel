@@ -140,11 +140,9 @@ mod tests {
 
     #[test]
     fn test_is_status_change_insert() {
-        let record = EventRecord {
-            event_name: "INSERT".to_string(),
-            change: StreamRecord::default(),
-            ..Default::default()
-        };
+        let mut record = EventRecord::default();
+        record.event_name = "INSERT".to_string();
+        record.change = StreamRecord::default();
 
         assert!(is_status_change_to_completed(&record));
     }
@@ -161,14 +159,12 @@ mod tests {
             serde_dynamo::AttributeValue::S("req_123".to_string()),
         );
 
-        let record = EventRecord {
-            event_name: "MODIFY".to_string(),
-            change: StreamRecord {
-                old_image: old_image.into(),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
+        let mut stream_record = StreamRecord::default();
+        stream_record.old_image = old_image.into();
+
+        let mut record = EventRecord::default();
+        record.event_name = "MODIFY".to_string();
+        record.change = stream_record;
 
         assert!(is_status_change_to_completed(&record));
     }

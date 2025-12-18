@@ -36,13 +36,9 @@ pub async fn handle_disconnect(
     }
 
     // Always return success response since connection is already closed
-    Ok(ApiGatewayProxyResponse {
-        status_code: 200,
-        headers: Default::default(),
-        multi_value_headers: Default::default(),
-        body: None,
-        is_base64_encoded: false,
-    })
+    let mut response = ApiGatewayProxyResponse::default();
+    response.status_code = 200;
+    Ok(response)
 }
 
 #[cfg(test)]

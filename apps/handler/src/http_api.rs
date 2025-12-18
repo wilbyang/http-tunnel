@@ -46,6 +46,9 @@ impl HttpApiRequest {
     /// 1. Check for `requestContext.http` - if present, it's v2
     /// 2. Check for `httpMethod` at root - if present, it's v1
     /// 3. Otherwise, try v2 first (our current infra), then v1 as fallback
+    ///
+    /// Note: We also normalize the event to ensure `requestContext.httpMethod` is present
+    /// for v1 events, as some API Gateway configurations may omit it.
     pub fn from_value(value: Value) -> Result<Self, String> {
         // Detection based on structure
         let is_v2 = value
@@ -60,7 +63,9 @@ impl HttpApiRequest {
                 .map(HttpApiRequest::V2)
                 .map_err(|e| format!("Failed to parse HTTP API v2 event: {}", e))
         } else if is_v1 {
-            serde_json::from_value::<ApiGatewayProxyRequest>(value)
+            // Normalize v1 event: ensure requestContext.httpMethod is present
+            let normalized = Self::normalize_v1_event(value);
+            serde_json::from_value::<ApiGatewayProxyRequest>(normalized)
                 .map(HttpApiRequest::V1)
                 .map_err(|e| format!("Failed to parse HTTP API v1 event: {}", e))
         } else {
@@ -68,7 +73,9 @@ impl HttpApiRequest {
             serde_json::from_value::<ApiGatewayV2httpRequest>(value.clone())
                 .map(HttpApiRequest::V2)
                 .or_else(|_| {
-                    serde_json::from_value::<ApiGatewayProxyRequest>(value).map(HttpApiRequest::V1)
+                    let normalized = Self::normalize_v1_event(value);
+                    serde_json::from_value::<ApiGatewayProxyRequest>(normalized)
+                        .map(HttpApiRequest::V1)
                 })
                 .map_err(|e| {
                     format!(
@@ -77,6 +84,24 @@ impl HttpApiRequest {
                     )
                 })
         }
+    }
+
+    /// Normalize a v1 API Gateway event to ensure all required fields are present.
+    ///
+    /// The `aws_lambda_events` crate requires `requestContext.httpMethod` to be present,
+    /// but some API Gateway configurations (like HTTP API with payload format v1.0)
+    /// may only include `httpMethod` at the root level. This function copies the
+    /// root-level `httpMethod` to `requestContext` if it's missing there.
+    fn normalize_v1_event(mut value: Value) -> Value {
+        // Copy httpMethod from root to requestContext if missing
+        if let Some(http_method) = value.get("httpMethod").cloned()
+            && let Some(request_context) = value.get_mut("requestContext")
+            && let Some(rc_obj) = request_context.as_object_mut()
+            && !rc_obj.contains_key("httpMethod")
+        {
+            rc_obj.insert("httpMethod".to_string(), http_method);
+        }
+        value
     }
 
     /// Get the API Gateway version
@@ -297,27 +322,24 @@ impl HttpApiResponseBuilder {
     pub fn build_v1(self) -> ApiGatewayProxyResponse {
         let body = self.body.map(Body::Text);
 
-        ApiGatewayProxyResponse {
-            status_code: self.status_code,
-            headers: self.headers,
-            multi_value_headers: Default::default(),
-            body,
-            is_base64_encoded: self.is_base64_encoded,
-        }
+        let mut response = ApiGatewayProxyResponse::default();
+        response.status_code = self.status_code;
+        response.headers = self.headers;
+        response.body = body;
+        response.is_base64_encoded = self.is_base64_encoded;
+        response
     }
 
     /// Build as v2 response
     pub fn build_v2(self) -> ApiGatewayV2httpResponse {
         let body = self.body.map(Body::Text);
 
-        ApiGatewayV2httpResponse {
-            status_code: self.status_code,
-            headers: self.headers,
-            multi_value_headers: Default::default(),
-            body,
-            is_base64_encoded: self.is_base64_encoded,
-            cookies: vec![],
-        }
+        let mut response = ApiGatewayV2httpResponse::default();
+        response.status_code = self.status_code;
+        response.headers = self.headers;
+        response.body = body;
+        response.is_base64_encoded = self.is_base64_encoded;
+        response
     }
 }
 
@@ -508,5 +530,71 @@ mod tests {
 
         let request = HttpApiRequest::from_value(event).unwrap();
         assert_eq!(request.host(), Some("example.tunnel.io"));
+    }
+
+    #[test]
+    fn test_v1_format_without_requestcontext_httpmethod() {
+        // HTTP API with payload format 1.0 may omit httpMethod in requestContext
+        // but include it at the root level. This test ensures we normalize the event.
+        let event = json!({
+            "version": "1.0",
+            "httpMethod": "POST",
+            "path": "/api/data",
+            "headers": {
+                "content-type": "application/json"
+            },
+            "queryStringParameters": null,
+            "body": "{\"key\":\"value\"}",
+            "isBase64Encoded": false,
+            "requestContext": {
+                "accountId": "123456789012",
+                "apiId": "api-id",
+                "domainName": "id.execute-api.us-east-1.amazonaws.com",
+                "domainPrefix": "id",
+                "requestId": "test-no-httpmethod",
+                "identity": {
+                    "sourceIp": "192.0.2.1",
+                    "userAgent": "test-agent"
+                },
+                "stage": "$default"
+            }
+        });
+
+        let request = HttpApiRequest::from_value(event).unwrap();
+        assert_eq!(request.version(), ApiGatewayVersion::V1);
+        assert_eq!(request.method(), "POST");
+        assert_eq!(request.path(), "/api/data");
+    }
+
+    #[test]
+    fn test_normalize_v1_event() {
+        let event = json!({
+            "httpMethod": "GET",
+            "requestContext": {
+                "requestId": "test-123"
+            }
+        });
+
+        let normalized = HttpApiRequest::normalize_v1_event(event);
+
+        // Check that httpMethod was copied to requestContext
+        assert_eq!(normalized["requestContext"]["httpMethod"], json!("GET"));
+    }
+
+    #[test]
+    fn test_normalize_v1_event_preserves_existing() {
+        // If requestContext already has httpMethod, don't overwrite
+        let event = json!({
+            "httpMethod": "POST",
+            "requestContext": {
+                "requestId": "test-123",
+                "httpMethod": "GET"  // Different from root
+            }
+        });
+
+        let normalized = HttpApiRequest::normalize_v1_event(event);
+
+        // Should preserve existing value
+        assert_eq!(normalized["requestContext"]["httpMethod"], json!("GET"));
     }
 }

@@ -100,13 +100,9 @@ pub async fn handle_response(
     }
 
     // Always return success
-    Ok(ApiGatewayProxyResponse {
-        status_code: 200,
-        headers: Default::default(),
-        multi_value_headers: Default::default(),
-        body: None,
-        is_base64_encoded: false,
-    })
+    let mut response = ApiGatewayProxyResponse::default();
+    response.status_code = 200;
+    Ok(response)
 }
 
 /// Handle HTTP response from agent
