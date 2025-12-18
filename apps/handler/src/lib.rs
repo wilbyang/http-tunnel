@@ -227,16 +227,26 @@ pub async fn lookup_connection_by_tunnel_id(
     let table_name = env::get_connections_table_name()?;
     let index_name = env::get_tunnel_id_index_name();
 
+    tracing::debug!(
+        "Looking up connection by tunnel_id={} in table={} index={}",
+        tunnel_id,
+        table_name,
+        index_name
+    );
+
     let result = client
         .query()
         .table_name(&table_name)
-        .index_name(index_name)
+        .index_name(&index_name)
         .key_condition_expression("tunnelId = :tunnel_id")
         .expression_attribute_values(":tunnel_id", AttributeValue::S(tunnel_id.to_string()))
         .limit(1)
         .send()
         .await
-        .context("Failed to query connection by tunnel ID")?;
+        .map_err(|e| {
+            tracing::error!("DynamoDB query error: {:?}", e);
+            anyhow::anyhow!("Failed to query connection by tunnel ID: {}", e)
+        })?;
 
     let items = result.items.ok_or_else(|| anyhow!("No items returned"))?;
     let item = items
