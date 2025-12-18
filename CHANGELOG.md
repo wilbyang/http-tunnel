@@ -3,6 +3,17 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [ttf-v0.3.2](https://github.com/compare/ttf-v0.3.1..ttf-v0.3.2) - 2025-12-18
+
+### Features
+
+- support both new and legacy env var names for DynamoDB tables - ([bb022f1](https://github.com/commit/bb022f1a5cc50133334fbbb4ed38e1a97429a170)) - Tyr Chen
+
+### Other
+
+- Update CHANGELOG.md - ([6c9f21a](https://github.com/commit/6c9f21a3208c75dfad9cd2cbab4064ca4520d31e)) - Tyr Chen
+
+---
 ## [ttf-v0.3.1](https://github.com/compare/ttf-v0.3.0..ttf-v0.3.1) - 2025-12-18
 
 ### Features
