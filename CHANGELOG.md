@@ -3,6 +3,21 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [ttf-v0.3.1](https://github.com/compare/ttf-v0.3.0..ttf-v0.3.1) - 2025-12-18
+
+### Features
+
+- support both API Gateway v1 and v2 payload formats - ([fec6eff](https://github.com/commit/fec6effb2863b4bb4972a3c615d7a528d379b290)) - Tyr Chen
+
+### Miscellaneous Chores
+
+- update readme - ([f3b222b](https://github.com/commit/f3b222b73636aee031bc10c6d72b0bd2e8b4b80f)) - Tyr Chen
+
+### Other
+
+- Update CHANGELOG.md - ([d4e3d95](https://github.com/commit/d4e3d95c00de5268fd202b9ee99cf7fa3c6d1d2d)) - Tyr Chen
+
+---
 ## [ttf-v0.3.0](https://github.com/compare/ttf-v0.2.1..ttf-v0.3.0) - 2025-10-26
 
 ### Features
