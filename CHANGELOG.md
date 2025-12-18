@@ -3,6 +3,17 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [ttf-v0.3.4](https://github.com/compare/ttf-v0.3.3..ttf-v0.3.4) - 2025-12-18
+
+### Bug Fixes
+
+- use configurable GSI index name for tunnel ID lookups - ([024dab2](https://github.com/commit/024dab2cf3eb3c37578ebfd99f470694904a36c5)) - Tyr Chen
+
+### Other
+
+- Update CHANGELOG.md - ([fda6788](https://github.com/commit/fda6788a4e3c970dd567b8519f2d7b3344fb0d9a)) - Tyr Chen
+
+---
 ## [ttf-v0.3.3](https://github.com/compare/ttf-v0.3.2..ttf-v0.3.3) - 2025-12-18
 
 ### Bug Fixes
