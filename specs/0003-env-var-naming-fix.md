@@ -3,10 +3,12 @@
 ## Problem
 
 The http-tunnel code expects these environment variables:
+
 - `CONNECTIONS_TABLE_NAME`
 - `PENDING_REQUESTS_TABLE_NAME`
 
-But the TubiLambdaService RGD auto-injects:
+But the LambdaService RGD auto-injects:
+
 - `DYNAMODB_TABLE0_NAME` (for table0 = connections)
 - `DYNAMODB_TABLE1_NAME` (for table1 = pendingRequests)
 
@@ -21,19 +23,25 @@ Update the http-tunnel code to use the RGD's auto-injected environment variable 
 **File: `apps/handler/src/lib.rs`**
 
 Change all occurrences of:
+
 ```rust
 std::env::var("CONNECTIONS_TABLE_NAME")
 ```
+
 to:
+
 ```rust
 std::env::var("DYNAMODB_TABLE0_NAME")
 ```
 
 Change all occurrences of:
+
 ```rust
 std::env::var("PENDING_REQUESTS_TABLE_NAME")
 ```
+
 to:
+
 ```rust
 std::env::var("DYNAMODB_TABLE1_NAME")
 ```
@@ -41,6 +49,7 @@ std::env::var("DYNAMODB_TABLE1_NAME")
 ### Specific Changes
 
 1. **`lookup_connection_by_tunnel_id` function:**
+
 ```rust
 // Change from:
 let table_name = std::env::var("CONNECTIONS_TABLE_NAME")
@@ -52,6 +61,7 @@ let table_name = std::env::var("DYNAMODB_TABLE0_NAME")
 ```
 
 2. **`save_connection_metadata` function:**
+
 ```rust
 // Change from:
 let table_name = std::env::var("CONNECTIONS_TABLE_NAME")
@@ -63,6 +73,7 @@ let table_name = std::env::var("DYNAMODB_TABLE0_NAME")
 ```
 
 3. **`delete_connection` function:**
+
 ```rust
 // Change from:
 let table_name = std::env::var("CONNECTIONS_TABLE_NAME")
@@ -74,6 +85,7 @@ let table_name = std::env::var("DYNAMODB_TABLE0_NAME")
 ```
 
 4. **`save_pending_request` function:**
+
 ```rust
 // Change from:
 let table_name = std::env::var("PENDING_REQUESTS_TABLE_NAME")
@@ -85,6 +97,7 @@ let table_name = std::env::var("DYNAMODB_TABLE1_NAME")
 ```
 
 5. **`wait_for_response_*` functions:**
+
 ```rust
 // Change from:
 let table_name = std::env::var("PENDING_REQUESTS_TABLE_NAME")
@@ -96,6 +109,7 @@ let table_name = std::env::var("DYNAMODB_TABLE1_NAME")
 ```
 
 6. **`update_pending_request_with_response` function:**
+
 ```rust
 // Change from:
 let table_name = std::env::var("PENDING_REQUESTS_TABLE_NAME")
@@ -116,6 +130,7 @@ let table_name = std::env::var("DYNAMODB_TABLE1_NAME")
 ### After Update
 
 1. Build and upload new version:
+
 ```bash
 cargo lambda build --release --arm64
 aws s3 cp target/lambda/http-tunnel-handler/bootstrap.zip \
@@ -126,6 +141,7 @@ aws s3 cp target/lambda/http-tunnel-handler/bootstrap.zip \
 2. Update deploy.yaml to use v0.3.2
 
 3. Remove the env vars from deploy.yaml that are no longer needed:
+
 ```yaml
 env:
   - "RUST_LOG=info"
