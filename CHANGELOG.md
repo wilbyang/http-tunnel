@@ -3,6 +3,21 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [ttf-v0.3.3](https://github.com/compare/ttf-v0.3.2..ttf-v0.3.3) - 2025-12-18
+
+### Bug Fixes
+
+- handle HTTP API payload format 1.0 missing requestContext.httpMethod - ([ee70f3f](https://github.com/commit/ee70f3f208d792b5cc46b3c80bef46ebd1c97f9a)) - Tyr Chen
+
+### Miscellaneous Chores
+
+- update doc - ([cfe87e2](https://github.com/commit/cfe87e218274d4b991de714c5901e90ca22bda74)) - Tyr Chen
+
+### Other
+
+- Update CHANGELOG.md - ([5b1fc21](https://github.com/commit/5b1fc21de5b020bf74e91602c9795266ae4d3488)) - Tyr Chen
+
+---
 ## [ttf-v0.3.2](https://github.com/compare/ttf-v0.3.1..ttf-v0.3.2) - 2025-12-18
 
 ### Features
