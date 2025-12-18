@@ -13,7 +13,7 @@ use lambda_runtime::{Error, LambdaEvent};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 
-use crate::{SharedClients, update_pending_request_with_response};
+use crate::{SharedClients, env, update_pending_request_with_response};
 use aws_sdk_apigatewaymanagement::primitives::Blob;
 
 /// WebSocket $default event structure (messages from agent)
@@ -139,8 +139,7 @@ async fn handle_ready_message(
     connection_id: &str,
 ) -> Result<(), Error> {
     // Look up connection metadata from DynamoDB
-    let table_name = std::env::var("CONNECTIONS_TABLE_NAME")
-        .map_err(|_| "CONNECTIONS_TABLE_NAME environment variable not set")?;
+    let table_name = env::get_connections_table_name().map_err(|e| format!("{}", e))?;
 
     let result = dynamodb_client
         .get_item()
@@ -252,8 +251,7 @@ async fn handle_error_response(
     code: ErrorCode,
     message: &str,
 ) -> Result<(), Error> {
-    let table_name = std::env::var("PENDING_REQUESTS_TABLE_NAME")
-        .map_err(|_| "PENDING_REQUESTS_TABLE_NAME environment variable not set")?;
+    let table_name = env::get_pending_requests_table_name().map_err(|e| format!("{}", e))?;
 
     // Create error response with appropriate status code
     let status_code = match code {

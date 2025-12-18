@@ -11,14 +11,15 @@ use lambda_runtime::Error;
 use serde_json::Value;
 use tracing::{error, info};
 
+use crate::env;
+
 /// Handler for scheduled cleanup (triggered by EventBridge)
 pub async fn handle_cleanup(_event: Value, dynamodb: &DynamoDbClient) -> Result<Value, Error> {
     info!("Starting TTL cleanup task");
 
-    let connections_table =
-        std::env::var("CONNECTIONS_TABLE_NAME").unwrap_or_else(|_| "connections".to_string());
-    let pending_requests_table = std::env::var("PENDING_REQUESTS_TABLE_NAME")
-        .unwrap_or_else(|_| "pending-requests".to_string());
+    let connections_table = env::get_connections_table_name_or_default("connections");
+    let pending_requests_table =
+        env::get_pending_requests_table_name_or_default("pending-requests");
 
     let now = current_timestamp_secs();
 

@@ -27,6 +27,7 @@ use tracing::{debug, error};
 
 pub mod auth;
 pub mod content_rewrite;
+pub mod env;
 pub mod error_handling;
 pub mod handlers;
 pub mod http_api;
@@ -170,8 +171,7 @@ pub async fn save_connection_metadata(
     client: &DynamoDbClient,
     metadata: &ConnectionMetadata,
 ) -> Result<()> {
-    let table_name = std::env::var("CONNECTIONS_TABLE_NAME")
-        .context("CONNECTIONS_TABLE_NAME environment variable not set")?;
+    let table_name = env::get_connections_table_name()?;
 
     let mut put_request = client
         .put_item()
@@ -206,8 +206,7 @@ pub async fn save_connection_metadata(
 
 /// Delete connection from DynamoDB
 pub async fn delete_connection(client: &DynamoDbClient, connection_id: &str) -> Result<()> {
-    let table_name = std::env::var("CONNECTIONS_TABLE_NAME")
-        .context("CONNECTIONS_TABLE_NAME environment variable not set")?;
+    let table_name = env::get_connections_table_name()?;
 
     client
         .delete_item()
@@ -225,8 +224,7 @@ pub async fn lookup_connection_by_tunnel_id(
     client: &DynamoDbClient,
     tunnel_id: &str,
 ) -> Result<String> {
-    let table_name = std::env::var("CONNECTIONS_TABLE_NAME")
-        .context("CONNECTIONS_TABLE_NAME environment variable not set")?;
+    let table_name = env::get_connections_table_name()?;
     let index_name = "tunnel-id-index";
 
     let result = client
@@ -300,8 +298,7 @@ pub async fn save_pending_request(
     connection_id: &str,
     api_gateway_request_id: &str,
 ) -> Result<()> {
-    let table_name = std::env::var("PENDING_REQUESTS_TABLE_NAME")
-        .context("PENDING_REQUESTS_TABLE_NAME environment variable not set")?;
+    let table_name = env::get_pending_requests_table_name()?;
     let created_at = current_timestamp_secs();
     let ttl = calculate_ttl(PENDING_REQUEST_TTL_SECS);
 
@@ -405,8 +402,7 @@ async fn wait_for_response_event_driven(
     client: &DynamoDbClient,
     request_id: &str,
 ) -> Result<HttpResponse> {
-    let table_name = std::env::var("PENDING_REQUESTS_TABLE_NAME")
-        .context("PENDING_REQUESTS_TABLE_NAME environment variable not set")?;
+    let table_name = env::get_pending_requests_table_name()?;
     let timeout = Duration::from_secs(REQUEST_TIMEOUT_SECS);
     let start = Instant::now();
 
@@ -447,8 +443,7 @@ async fn wait_for_response_polling(
     client: &DynamoDbClient,
     request_id: &str,
 ) -> Result<HttpResponse> {
-    let table_name = std::env::var("PENDING_REQUESTS_TABLE_NAME")
-        .context("PENDING_REQUESTS_TABLE_NAME environment variable not set")?;
+    let table_name = env::get_pending_requests_table_name()?;
     let timeout = Duration::from_secs(REQUEST_TIMEOUT_SECS);
     let start = Instant::now();
 
@@ -549,8 +544,7 @@ pub async fn update_pending_request_with_response(
     client: &DynamoDbClient,
     response: &HttpResponse,
 ) -> Result<()> {
-    let table_name = std::env::var("PENDING_REQUESTS_TABLE_NAME")
-        .context("PENDING_REQUESTS_TABLE_NAME environment variable not set")?;
+    let table_name = env::get_pending_requests_table_name()?;
 
     // Serialize response to JSON
     let response_data =
