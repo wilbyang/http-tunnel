@@ -5,7 +5,7 @@
 //! - WebSocket $connect - handle_connect
 //! - WebSocket $disconnect - handle_disconnect
 //! - WebSocket $default (messages from agent) - handle_response
-//! - HTTP API requests (forwarding) - handle_forwarding
+//! - HTTP API requests (forwarding) - handle_forwarding (supports both v1 and v2 formats)
 
 use aws_sdk_apigatewaymanagement::Client as ApiGatewayManagementClient;
 use aws_sdk_dynamodb::Client as DynamoDbClient;
@@ -15,6 +15,7 @@ use http_tunnel_handler::handlers::{
     handle_cleanup, handle_connect, handle_disconnect, handle_forwarding, handle_response,
     handle_stream,
 };
+use http_tunnel_handler::http_api::HttpApiRequest;
 use lambda_runtime::{Error, LambdaEvent, run, service_fn};
 use serde_json::Value;
 use tracing::info;
@@ -118,12 +119,16 @@ async fn function_handler(
                 .map_err(|e| format!("Failed to serialize response: {}", e).into())
         }
         EventType::HttpApi => {
-            // Parse as HTTP API event and handle forwarding
-            let http_event = serde_json::from_value(event.payload)
+            // Parse as HTTP API event (supports both v1 and v2 formats)
+            let http_request = HttpApiRequest::from_value(event.payload)
                 .map_err(|e| format!("Failed to parse HTTP API event: {}", e))?;
-            let lambda_event = LambdaEvent::new(http_event, event.context);
+
+            info!("Detected API Gateway version: {:?}", http_request.version());
+
+            let lambda_event = LambdaEvent::new(http_request, event.context);
             let response = handle_forwarding(lambda_event, clients).await?;
-            serde_json::to_value(response)
+            response
+                .into_value()
                 .map_err(|e| format!("Failed to serialize response: {}", e).into())
         }
         EventType::ScheduledCleanup => {

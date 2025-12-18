@@ -2,9 +2,13 @@
 //!
 //! This module provides common functionality used across all Lambda functions including
 //! DynamoDB operations, request/response transformations, and helper functions.
+//!
+//! ## API Gateway Version Support
+//!
+//! This module supports both API Gateway v1 (REST API) and v2 (HTTP API) through
+//! the `http_api` module which provides unified abstractions.
 
 use anyhow::{Context, Result, anyhow};
-use aws_lambda_events::apigw::{ApiGatewayProxyRequest, ApiGatewayProxyResponse};
 use aws_sdk_apigatewaymanagement::Client as ApiGatewayManagementClient;
 use aws_sdk_apigatewaymanagement::primitives::Blob;
 use aws_sdk_dynamodb::Client as DynamoDbClient;
@@ -25,6 +29,7 @@ pub mod auth;
 pub mod content_rewrite;
 pub mod error_handling;
 pub mod handlers;
+pub mod http_api;
 
 /// Check if event-driven response pattern is enabled
 pub fn is_event_driven_enabled() -> bool {
@@ -248,42 +253,29 @@ pub async fn lookup_connection_by_tunnel_id(
     Ok(connection_id.clone())
 }
 
-/// Build HttpRequest from API Gateway event
-pub fn build_http_request(request: &ApiGatewayProxyRequest, request_id: String) -> HttpRequest {
-    let method = request.http_method.to_string();
+/// Build HttpRequest from unified API Gateway request (supports both v1 and v2)
+pub fn build_http_request(request: &http_api::HttpApiRequest, request_id: String) -> HttpRequest {
+    let method = request.method();
 
-    let uri = format!("{}{}", request.path.as_deref().unwrap_or("/"), {
-        let params = &request.query_string_parameters;
-        if params.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "?{}",
-                params
-                    .iter()
-                    .map(|(k, v)| format!("{}={}", k, v))
-                    .collect::<Vec<_>>()
-                    .join("&")
-            )
-        }
-    });
+    // Build URI with path and query string
+    let query_string = request.query_string();
+    let uri = if query_string.is_empty() {
+        request.path().to_string()
+    } else {
+        format!("{}?{}", request.path(), query_string)
+    };
 
+    // Convert headers
     let headers = request
-        .headers
-        .iter()
-        .map(|(k, v)| {
-            (
-                k.as_str().to_string(),
-                vec![v.to_str().unwrap_or("").to_string()],
-            )
-        })
+        .headers()
+        .map(|(k, v)| (k.to_string(), vec![v.to_string()]))
         .collect();
 
+    // Handle body encoding
     let body = request
-        .body
-        .as_ref()
+        .body()
         .map(|b| {
-            if request.is_base64_encoded {
+            if request.is_base64_encoded() {
                 b.to_string() // Already base64
             } else {
                 http_tunnel_common::encode_body(b.as_bytes())
@@ -516,11 +508,15 @@ async fn wait_for_response_polling(
     }
 }
 
-/// Convert HttpResponse to API Gateway response
-pub fn build_api_gateway_response(response: HttpResponse) -> ApiGatewayProxyResponse {
-    use http::header::{HeaderName, HeaderValue};
+/// Convert HttpResponse to API Gateway response (supports both v1 and v2)
+pub fn build_api_gateway_response(
+    version: http_api::ApiGatewayVersion,
+    response: HttpResponse,
+) -> http_api::HttpApiResponse {
+    use http::header::{HeaderMap, HeaderName, HeaderValue};
 
-    let headers = response
+    // Convert headers
+    let headers: HeaderMap = response
         .headers
         .iter()
         .filter_map(|(k, v)| {
@@ -532,21 +528,20 @@ pub fn build_api_gateway_response(response: HttpResponse) -> ApiGatewayProxyResp
         })
         .collect();
 
-    use aws_lambda_events::encodings::Body;
-
+    // Build response using the unified builder
     let body = if !response.body.is_empty() {
-        Some(Body::Text(response.body))
+        Some(response.body)
     } else {
         None
     };
 
-    ApiGatewayProxyResponse {
-        status_code: response.status_code as i64,
-        headers,
-        multi_value_headers: Default::default(),
-        body,
-        is_base64_encoded: true,
-    }
+    http_api::HttpApiResponse::from_builder(
+        http_api::HttpApiResponseBuilder::new(version)
+            .status_code(response.status_code as i64)
+            .headers(headers)
+            .body_opt(body)
+            .base64_encoded(true),
+    )
 }
 
 /// Update pending request with response data
@@ -582,17 +577,50 @@ pub async fn update_pending_request_with_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    // Helper to create v1 test request
+    // V1 format requires requestContext with identity and httpMethod fields
+    fn create_v1_request(method: &str, path: &str, body: Option<&str>) -> http_api::HttpApiRequest {
+        let event = json!({
+            "httpMethod": method,
+            "path": path,
+            "headers": {},
+            "queryStringParameters": null,
+            "body": body,
+            "isBase64Encoded": false,
+            "requestContext": {
+                "requestId": "test-123",
+                "httpMethod": method,
+                "identity": {}
+            }
+        });
+        http_api::HttpApiRequest::from_value(event).unwrap()
+    }
+
+    // Helper to create v2 test request
+    fn create_v2_request(method: &str, path: &str, body: Option<&str>) -> http_api::HttpApiRequest {
+        let event = json!({
+            "version": "2.0",
+            "rawPath": path,
+            "rawQueryString": "",
+            "headers": {},
+            "requestContext": {
+                "http": {
+                    "method": method,
+                    "path": path
+                },
+                "requestId": "test-456"
+            },
+            "body": body,
+            "isBase64Encoded": false
+        });
+        http_api::HttpApiRequest::from_value(event).unwrap()
+    }
 
     #[test]
-    fn test_build_http_request_simple_get() {
-        use http::Method;
-
-        let request = ApiGatewayProxyRequest {
-            http_method: Method::GET,
-            path: Some("/api/users".to_string()),
-            ..Default::default()
-        };
-
+    fn test_build_http_request_v1_simple_get() {
+        let request = create_v1_request("GET", "/api/users", None);
         let http_request = build_http_request(&request, "req_123".to_string());
 
         assert_eq!(http_request.request_id, "req_123");
@@ -602,34 +630,19 @@ mod tests {
     }
 
     #[test]
-    fn test_build_http_request_with_path() {
-        use http::Method;
-
-        let request = ApiGatewayProxyRequest {
-            http_method: Method::GET,
-            path: Some("/api/users".to_string()),
-            ..Default::default()
-        };
-
+    fn test_build_http_request_v2_simple_get() {
+        let request = create_v2_request("GET", "/api/users", None);
         let http_request = build_http_request(&request, "req_123".to_string());
 
         assert_eq!(http_request.request_id, "req_123");
         assert_eq!(http_request.method, "GET");
         assert_eq!(http_request.uri, "/api/users");
+        assert!(http_request.body.is_empty());
     }
 
     #[test]
-    fn test_build_http_request_with_body() {
-        use http::Method;
-
-        let request = ApiGatewayProxyRequest {
-            http_method: Method::POST,
-            path: Some("/api/data".to_string()),
-            body: Some("Hello World".to_string()),
-            is_base64_encoded: false,
-            ..Default::default()
-        };
-
+    fn test_build_http_request_v1_with_body() {
+        let request = create_v1_request("POST", "/api/data", Some("Hello World"));
         let http_request = build_http_request(&request, "req_123".to_string());
 
         assert_eq!(http_request.method, "POST");
@@ -637,7 +650,16 @@ mod tests {
     }
 
     #[test]
-    fn test_build_api_gateway_response_success() {
+    fn test_build_http_request_v2_with_body() {
+        let request = create_v2_request("POST", "/api/data", Some("Hello World"));
+        let http_request = build_http_request(&request, "req_123".to_string());
+
+        assert_eq!(http_request.method, "POST");
+        assert!(!http_request.body.is_empty());
+    }
+
+    #[test]
+    fn test_build_api_gateway_response_v1_success() {
         use std::collections::HashMap;
 
         let mut headers = HashMap::new();
@@ -654,13 +676,48 @@ mod tests {
             processing_time_ms: 123,
         };
 
-        let apigw_response = build_api_gateway_response(response);
+        let apigw_response = build_api_gateway_response(http_api::ApiGatewayVersion::V1, response);
 
-        assert_eq!(apigw_response.status_code, 200);
-        assert!(apigw_response.is_base64_encoded);
-        assert!(apigw_response.body.is_some());
-        // Check header exists (actual value checking would require http types)
-        assert!(!apigw_response.headers.is_empty());
+        match apigw_response {
+            http_api::HttpApiResponse::V1(resp) => {
+                assert_eq!(resp.status_code, 200);
+                assert!(resp.is_base64_encoded);
+                assert!(resp.body.is_some());
+                assert!(!resp.headers.is_empty());
+            }
+            _ => panic!("Expected V1 response"),
+        }
+    }
+
+    #[test]
+    fn test_build_api_gateway_response_v2_success() {
+        use std::collections::HashMap;
+
+        let mut headers = HashMap::new();
+        headers.insert(
+            "content-type".to_string(),
+            vec!["application/json".to_string()],
+        );
+
+        let response = HttpResponse {
+            request_id: "req_123".to_string(),
+            status_code: 200,
+            headers,
+            body: "eyJ0ZXN0IjoidmFsdWUifQ==".to_string(),
+            processing_time_ms: 123,
+        };
+
+        let apigw_response = build_api_gateway_response(http_api::ApiGatewayVersion::V2, response);
+
+        match apigw_response {
+            http_api::HttpApiResponse::V2(resp) => {
+                assert_eq!(resp.status_code, 200);
+                assert!(resp.is_base64_encoded);
+                assert!(resp.body.is_some());
+                assert!(!resp.headers.is_empty());
+            }
+            _ => panic!("Expected V2 response"),
+        }
     }
 
     #[test]
@@ -675,10 +732,49 @@ mod tests {
             processing_time_ms: 0,
         };
 
-        let apigw_response = build_api_gateway_response(response);
+        // Test both versions
+        let v1_response =
+            build_api_gateway_response(http_api::ApiGatewayVersion::V1, response.clone());
+        let v2_response = build_api_gateway_response(http_api::ApiGatewayVersion::V2, response);
 
-        assert_eq!(apigw_response.status_code, 204);
-        assert!(apigw_response.body.is_none());
+        match v1_response {
+            http_api::HttpApiResponse::V1(resp) => {
+                assert_eq!(resp.status_code, 204);
+                assert!(resp.body.is_none());
+            }
+            _ => panic!("Expected V1 response"),
+        }
+
+        match v2_response {
+            http_api::HttpApiResponse::V2(resp) => {
+                assert_eq!(resp.status_code, 204);
+                assert!(resp.body.is_none());
+            }
+            _ => panic!("Expected V2 response"),
+        }
+    }
+
+    #[test]
+    fn test_v2_request_with_query_string() {
+        let event = json!({
+            "version": "2.0",
+            "rawPath": "/api/search",
+            "rawQueryString": "q=test&limit=10",
+            "headers": {},
+            "requestContext": {
+                "http": {
+                    "method": "GET",
+                    "path": "/api/search"
+                },
+                "requestId": "test-789"
+            },
+            "isBase64Encoded": false
+        });
+
+        let request = http_api::HttpApiRequest::from_value(event).unwrap();
+        let http_request = build_http_request(&request, "req_123".to_string());
+
+        assert_eq!(http_request.uri, "/api/search?q=test&limit=10");
     }
 
     // Subdomain extraction tests

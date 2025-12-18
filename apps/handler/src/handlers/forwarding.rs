@@ -1,47 +1,51 @@
 //! ForwardingHandler - Handles HTTP API requests
 //!
-//! This module receives public HTTP requests via API Gateway HTTP API,
+//! This module receives public HTTP requests via API Gateway HTTP API (v1 or v2),
 //! looks up the connection by subdomain, forwards the request to the agent via WebSocket,
 //! and polls for the response. If no response is received within the timeout,
 //! it returns a 504 Gateway Timeout.
+//!
+//! ## API Gateway Version Support
+//!
+//! This handler supports both API Gateway v1 (REST API) and v2 (HTTP API) formats
+//! through the unified `HttpApiRequest` abstraction. The response format automatically
+//! matches the request format.
 
-use aws_lambda_events::apigw::{ApiGatewayProxyRequest, ApiGatewayProxyResponse};
 use http_tunnel_common::constants::MAX_BODY_SIZE_BYTES;
 use http_tunnel_common::protocol::Message;
 use http_tunnel_common::utils::generate_request_id;
 use lambda_runtime::{Error, LambdaEvent};
 use tracing::{debug, error, info, warn};
 
+use crate::http_api::{HttpApiRequest, HttpApiResponse, error_response_with_headers};
 use crate::{
     SharedClients, build_api_gateway_response, build_http_request, content_rewrite,
     detect_routing_mode, lookup_connection_by_tunnel_id, save_pending_request, send_to_connection,
     wait_for_response,
 };
 
-/// Handler for HTTP API requests
+/// Handler for HTTP API requests (supports both v1 and v2 formats)
 pub async fn handle_forwarding(
-    event: LambdaEvent<ApiGatewayProxyRequest>,
+    event: LambdaEvent<HttpApiRequest>,
     clients: &SharedClients,
-) -> Result<ApiGatewayProxyResponse, Error> {
+) -> Result<HttpApiResponse, Error> {
     let mut request = event.payload;
-    let request_id_context = request.request_context.request_id.clone();
+    let api_version = request.version();
+    let request_id_context = request.request_id().map(|s| s.to_string());
 
     // Get domain from environment
     let domain = std::env::var("DOMAIN_NAME").unwrap_or_else(|_| "tunnel.example.com".to_string());
 
     // Extract host header
     let host = request
-        .headers
-        .get("host")
-        .or_else(|| request.headers.get("Host"))
-        .and_then(|h| h.to_str().ok())
+        .host()
         .ok_or_else(|| "Missing Host header".to_string())?;
 
-    let original_path = request.path.as_deref().unwrap_or("/");
+    let original_path = request.path();
 
     debug!(
-        "Processing HTTP request, host: {}, path: {}",
-        host, original_path
+        "Processing HTTP request (API Gateway {:?}), host: {}, path: {}",
+        api_version, host, original_path
     );
 
     // Detect routing mode (subdomain vs path-based)
@@ -63,11 +67,11 @@ pub async fn handle_forwarding(
     );
 
     // Update request path to forwarding path
-    request.path = Some(forwarding_path.to_string());
+    request.set_path(forwarding_path.to_string());
 
     // Enforce request size limits
-    if let Some(body) = &request.body {
-        let body_size = if request.is_base64_encoded {
+    if let Some(body) = request.body() {
+        let body_size = if request.is_base64_encoded() {
             // Estimate decoded size (base64 is ~33% larger than binary)
             (body.len() * 3) / 4
         } else {
@@ -75,35 +79,20 @@ pub async fn handle_forwarding(
         };
 
         if body_size > MAX_BODY_SIZE_BYTES {
-            use aws_lambda_events::encodings::Body;
-            use http::header::{HeaderName, HeaderValue};
-
             warn!(
                 "Request body too large: {} bytes (max: {} bytes) for tunnel {}",
                 body_size, MAX_BODY_SIZE_BYTES, tunnel_id
             );
 
-            return Ok(ApiGatewayProxyResponse {
-                status_code: 413,
-                headers: [
-                    (
-                        HeaderName::from_static("content-type"),
-                        HeaderValue::from_static("text/plain"),
-                    ),
-                    (
-                        HeaderName::from_static("x-tunnel-error"),
-                        HeaderValue::from_static("Request Entity Too Large"),
-                    ),
-                ]
-                .into_iter()
-                .collect(),
-                multi_value_headers: Default::default(),
-                body: Some(Body::Text(format!(
+            return Ok(error_response_with_headers(
+                api_version,
+                413,
+                &format!(
                     "Request body too large: {} bytes (maximum: {} bytes)",
                     body_size, MAX_BODY_SIZE_BYTES
-                ))),
-                is_base64_encoded: false,
-            });
+                ),
+                &[("x-tunnel-error", "Request Entity Too Large")],
+            ));
         }
     }
 
@@ -252,35 +241,18 @@ pub async fn handle_forwarding(
                 );
             }
 
-            // Convert HttpResponse to API Gateway response
-            Ok(build_api_gateway_response(response))
+            // Convert HttpResponse to API Gateway response (matching request version)
+            Ok(build_api_gateway_response(api_version, response))
         }
         Err(e) => {
-            use aws_lambda_events::encodings::Body;
-            use http::header::{HeaderName, HeaderValue};
-
             error!("Request {} timeout or error: {}", request_id, e);
             // Return 504 Gateway Timeout
-            Ok(ApiGatewayProxyResponse {
-                status_code: 504,
-                headers: [
-                    (
-                        HeaderName::from_static("content-type"),
-                        HeaderValue::from_static("text/plain"),
-                    ),
-                    (
-                        HeaderName::from_static("x-tunnel-error"),
-                        HeaderValue::from_static("Gateway Timeout"),
-                    ),
-                ]
-                .into_iter()
-                .collect(),
-                multi_value_headers: Default::default(),
-                body: Some(Body::Text(
-                    "Gateway Timeout: No response from agent".to_string(),
-                )),
-                is_base64_encoded: false,
-            })
+            Ok(error_response_with_headers(
+                api_version,
+                504,
+                "Gateway Timeout: No response from agent",
+                &[("x-tunnel-error", "Gateway Timeout")],
+            ))
         }
     }
 }
@@ -288,28 +260,56 @@ pub async fn handle_forwarding(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aws_lambda_events::encodings::Body;
-    use http::header::{HeaderName, HeaderValue};
+    use crate::http_api::ApiGatewayVersion;
 
     #[test]
-    fn test_timeout_response_format() {
-        let response = ApiGatewayProxyResponse {
-            status_code: 504,
-            headers: [(
-                HeaderName::from_static("content-type"),
-                HeaderValue::from_static("text/plain"),
-            )]
-            .into_iter()
-            .collect(),
-            multi_value_headers: Default::default(),
-            body: Some(Body::Text(
-                "Gateway Timeout: No response from agent".to_string(),
-            )),
-            is_base64_encoded: false,
-        };
+    fn test_timeout_response_format_v1() {
+        let response = error_response_with_headers(
+            ApiGatewayVersion::V1,
+            504,
+            "Gateway Timeout: No response from agent",
+            &[("x-tunnel-error", "Gateway Timeout")],
+        );
 
-        assert_eq!(response.status_code, 504);
-        assert!(!response.headers.is_empty());
-        assert!(response.body.is_some());
+        match response {
+            HttpApiResponse::V1(resp) => {
+                assert_eq!(resp.status_code, 504);
+                assert!(!resp.headers.is_empty());
+                assert!(resp.body.is_some());
+            }
+            _ => panic!("Expected V1 response"),
+        }
+    }
+
+    #[test]
+    fn test_timeout_response_format_v2() {
+        let response = error_response_with_headers(
+            ApiGatewayVersion::V2,
+            504,
+            "Gateway Timeout: No response from agent",
+            &[("x-tunnel-error", "Gateway Timeout")],
+        );
+
+        match response {
+            HttpApiResponse::V2(resp) => {
+                assert_eq!(resp.status_code, 504);
+                assert!(!resp.headers.is_empty());
+                assert!(resp.body.is_some());
+            }
+            _ => panic!("Expected V2 response"),
+        }
+    }
+
+    #[test]
+    fn test_body_too_large_response() {
+        let response = error_response_with_headers(
+            ApiGatewayVersion::V2,
+            413,
+            "Request body too large: 20000000 bytes (maximum: 10485760 bytes)",
+            &[("x-tunnel-error", "Request Entity Too Large")],
+        );
+
+        let value = response.into_value().unwrap();
+        assert_eq!(value["statusCode"], 413);
     }
 }
