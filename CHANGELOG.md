@@ -3,6 +3,17 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [ttf-v0.3.5](https://github.com/compare/ttf-v0.3.4..ttf-v0.3.5) - 2025-12-18
+
+### Miscellaneous Chores
+
+- improve logging - ([c646849](https://github.com/commit/c64684903ed0db1b37c9b5028e24edda9c72d45a)) - Tyr Chen
+
+### Other
+
+- Update CHANGELOG.md - ([10e218e](https://github.com/commit/10e218eea864cc50020cd03121e8d1535c6ca832)) - Tyr Chen
+
+---
 ## [ttf-v0.3.4](https://github.com/compare/ttf-v0.3.3..ttf-v0.3.4) - 2025-12-18
 
 ### Bug Fixes
