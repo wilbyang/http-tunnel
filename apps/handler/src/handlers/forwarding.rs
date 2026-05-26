@@ -24,6 +24,37 @@ use crate::{
     wait_for_response,
 };
 
+fn strip_http_api_stage_prefix(host: &str, path: &str) -> String {
+    let Some(endpoint) = std::env::var("HTTP_API_ENDPOINT").ok() else {
+        return path.to_string();
+    };
+
+    let endpoint = endpoint
+        .strip_prefix("https://")
+        .or_else(|| endpoint.strip_prefix("http://"))
+        .unwrap_or(&endpoint);
+
+    let Some((endpoint_host, endpoint_path)) = endpoint.split_once('/') else {
+        return path.to_string();
+    };
+
+    if host != endpoint_host {
+        return path.to_string();
+    }
+
+    let stage_prefix = format!("/{}", endpoint_path.trim_matches('/'));
+    if stage_prefix == "/" {
+        return path.to_string();
+    }
+
+    match path.strip_prefix(&stage_prefix) {
+        Some("") => "/".to_string(),
+        Some(stripped) if stripped.starts_with('/') => stripped.to_string(),
+        Some(stripped) => format!("/{}", stripped),
+        None => path.to_string(),
+    }
+}
+
 /// Handler for HTTP API requests (supports both v1 and v2 formats)
 pub async fn handle_forwarding(
     event: LambdaEvent<HttpApiRequest>,
@@ -42,17 +73,18 @@ pub async fn handle_forwarding(
         .ok_or_else(|| "Missing Host header".to_string())?;
 
     let original_path = request.path();
+    let normalized_path = strip_http_api_stage_prefix(host, original_path);
 
     debug!(
-        "Processing HTTP request (API Gateway {:?}), host: {}, path: {}",
-        api_version, host, original_path
+        "Processing HTTP request (API Gateway {:?}), host: {}, path: {}, normalized_path: {}",
+        api_version, host, original_path, normalized_path
     );
 
     // Detect routing mode (subdomain vs path-based)
-    let routing_mode = detect_routing_mode(host, original_path, &domain).map_err(|e| {
+    let routing_mode = detect_routing_mode(host, &normalized_path, &domain).map_err(|e| {
         error!(
             "Failed to detect routing mode for host {} path {}: {}",
-            host, original_path, e
+            host, normalized_path, e
         );
         // Sanitized error - don't leak internal details
         "Invalid request".to_string()

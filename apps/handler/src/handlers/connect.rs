@@ -13,6 +13,38 @@ use tracing::{error, info};
 
 use crate::{SharedClients, auth, error_handling::sanitize_error, save_connection_metadata};
 
+fn is_enabled(var_name: &str, default: bool) -> bool {
+    std::env::var(var_name)
+        .unwrap_or_else(|_| default.to_string())
+        .to_lowercase()
+        == "true"
+}
+
+fn build_public_urls(tunnel_id: &str) -> (String, Option<String>, String) {
+    let custom_domain_enabled = is_enabled("ENABLE_CUSTOM_DOMAIN", false);
+
+    if !custom_domain_enabled {
+        let http_api_endpoint = std::env::var("HTTP_API_ENDPOINT").unwrap_or_else(|_| {
+            "https://example.execute-api.us-east-1.amazonaws.com/dev".to_string()
+        });
+        let path_based_url = format!("{}/{}", http_api_endpoint.trim_end_matches('/'), tunnel_id);
+        return (path_based_url.clone(), None, path_based_url);
+    }
+
+    let domain = std::env::var("DOMAIN_NAME").unwrap_or_else(|_| "tunnel.example.com".to_string());
+    let subdomain_enabled = is_enabled("ENABLE_SUBDOMAIN_ROUTING", true);
+
+    let path_based_url = format!("https://{}/{}", domain, tunnel_id);
+    let subdomain_url = if subdomain_enabled {
+        Some(format!("https://{}.{}", tunnel_id, domain))
+    } else {
+        None
+    };
+    let public_url = subdomain_url.as_ref().unwrap_or(&path_based_url).clone();
+
+    (public_url, subdomain_url, path_based_url)
+}
+
 /// Handler for WebSocket $connect route
 pub async fn handle_connect(
     event: LambdaEvent<ApiGatewayWebsocketProxyRequest>,
@@ -37,24 +69,7 @@ pub async fn handle_connect(
 
     // Generate unique tunnel ID (path segment)
     let tunnel_id = generate_subdomain(); // Reusing subdomain generator for random ID
-    let domain = std::env::var("DOMAIN_NAME").unwrap_or_else(|_| "tunnel.example.com".to_string());
-
-    // Check if subdomain routing is enabled
-    let subdomain_enabled = std::env::var("ENABLE_SUBDOMAIN_ROUTING")
-        .unwrap_or_else(|_| "true".to_string())
-        .to_lowercase()
-        == "true";
-
-    // Generate both URL formats
-    let path_based_url = format!("https://{}/{}", domain, tunnel_id);
-    let subdomain_url = if subdomain_enabled {
-        Some(format!("https://{}.{}", tunnel_id, domain))
-    } else {
-        None
-    };
-
-    // Use subdomain URL as primary if enabled, otherwise path-based
-    let public_url = subdomain_url.as_ref().unwrap_or(&path_based_url).clone();
+    let (public_url, subdomain_url, path_based_url) = build_public_urls(&tunnel_id);
 
     // Calculate TTL (2 hours from now)
     let created_at = current_timestamp_secs();
@@ -102,6 +117,7 @@ pub async fn handle_connect(
 
 #[cfg(test)]
 mod tests {
+    use super::build_public_urls;
     use http_tunnel_common::utils::generate_subdomain;
 
     #[test]
@@ -117,5 +133,28 @@ mod tests {
         let domain = "tunnel.example.com";
         let public_url = format!("https://{}.{}", subdomain, domain);
         assert_eq!(public_url, "https://abc123def456.tunnel.example.com");
+    }
+
+    #[test]
+    fn test_public_urls_without_custom_domain_use_http_api_endpoint() {
+        unsafe {
+            std::env::set_var("ENABLE_CUSTOM_DOMAIN", "false");
+            std::env::set_var(
+                "HTTP_API_ENDPOINT",
+                "https://api-id.execute-api.eu-west-1.amazonaws.com/dev",
+            );
+        }
+
+        let (public_url, subdomain_url, path_based_url) = build_public_urls("abc123def456");
+
+        assert_eq!(
+            public_url,
+            "https://api-id.execute-api.eu-west-1.amazonaws.com/dev/abc123def456"
+        );
+        assert_eq!(
+            path_based_url,
+            "https://api-id.execute-api.eu-west-1.amazonaws.com/dev/abc123def456"
+        );
+        assert_eq!(subdomain_url, None);
     }
 }

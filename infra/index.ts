@@ -53,16 +53,27 @@ const preliminaryWebsocketStage = new aws.apigatewayv2.Stage("websocket-stage", 
 
 const websocketEndpoint = pulumi.interpolate`wss://${preliminaryWebsocketApi.id}.execute-api.${appConfig.awsRegion}.amazonaws.com/${preliminaryWebsocketStage.name}`;
 
-// Step 4: Create Lambda handler with the WebSocket endpoint
+// Step 4: Create HTTP API
+const httpApi = new aws.apigatewayv2.Api("http-api", {
+  name: pulumi.interpolate`http-tunnel-http-${appConfig.environment}`,
+  protocolType: "HTTP",
+  tags: {
+    ...tags,
+    Name: "HTTP Tunnel HTTP API",
+  },
+});
+
+// Step 5: Create Lambda handler with the WebSocket endpoint
 const handler = createLambdaHandler(
   handlerRole,
   connectionsTable.name,
   pendingRequestsTable.name,
+  httpApi.id,
   websocketEndpoint,
   eventBus.name
 );
 
-// Step 5: Add WebSocket API permissions to the IAM role
+// Step 6: Add WebSocket API permissions to the IAM role
 new aws.iam.RolePolicy("handler-websocket-policy", {
   role: handlerRole,
   policy: preliminaryWebsocketApi.executionArn.apply((wsApiExecArn: string) =>
@@ -80,7 +91,7 @@ new aws.iam.RolePolicy("handler-websocket-policy", {
   ),
 });
 
-// Step 6: Create WebSocket API routes
+// Step 7: Create WebSocket API routes
 // $connect route
 const connectIntegration = new aws.apigatewayv2.Integration(
   "connect-integration",
@@ -150,16 +161,6 @@ new aws.lambda.Permission("response-lambda-permission", {
   sourceArn: pulumi.interpolate`${preliminaryWebsocketApi.executionArn}/*/$default`,
 });
 
-// Step 7: Create HTTP API
-const httpApi = new aws.apigatewayv2.Api("http-api", {
-  name: pulumi.interpolate`http-tunnel-http-${appConfig.environment}`,
-  protocolType: "HTTP",
-  tags: {
-    ...tags,
-    Name: "HTTP Tunnel HTTP API",
-  },
-});
-
 const forwardingIntegration = new aws.apigatewayv2.Integration(
   "forwarding-integration",
   {
@@ -198,7 +199,7 @@ const httpStage = new aws.apigatewayv2.Stage("http-stage", {
   },
 });
 
-const httpEndpoint = pulumi.interpolate`https://${httpApi.id}.execute-api.${appConfig.awsRegion}.amazonaws.com`;
+const httpEndpoint = pulumi.interpolate`https://${httpApi.id}.execute-api.${appConfig.awsRegion}.amazonaws.com/${httpStage.name}`;
 
 // Step 8: Wire DynamoDB Stream to Lambda for event-driven responses
 const streamMapping = createStreamMapping(handler, pendingRequestsTable);

@@ -79,7 +79,10 @@ make deploy-infra
 ttf
 
 # Or specify custom endpoint and port
-ttf --endpoint wss://YOUR_WEBSOCKET_ENDPOINT --local-port 8080
+ttf --endpoint wss://YOUR_WEBSOCKET_ENDPOINT --port 8080
+
+# If your WebSocket API requires an API key on $connect
+ttf --endpoint wss://YOUR_WEBSOCKET_ENDPOINT --api-key YOUR_API_KEY
 
 # You'll receive a public URL like: https://abc123.execute-api.us-west-2.amazonaws.com
 ```
@@ -391,14 +394,30 @@ ttf -p 8080
 ttf --endpoint wss://ws.yourdomain.com
 ```
 
+### With Authentication
+
+```bash
+# Send a JWT as Authorization: Bearer <token>
+ttf --token YOUR_JWT
+
+# Send an API key as x-api-key during the WebSocket handshake
+ttf --api-key YOUR_API_KEY
+
+# You can use both when the deployment requires them
+ttf --token YOUR_JWT --api-key YOUR_API_KEY
+```
+
 ### Environment Variables
 
 ```bash
 # Override default endpoint via environment variable
-export TUNNEL_ENDPOINT=wss://YOUR_CUSTOM_ENDPOINT
+export TTF_ENDPOINT=wss://YOUR_CUSTOM_ENDPOINT
 
 # Set authentication token
-export TUNNEL_TOKEN=your_jwt_token
+export TTF_TOKEN=your_jwt_token
+
+# Set API key for the WebSocket handshake
+export TTF_API_KEY=your_api_key
 
 # Run with environment configuration
 ttf
@@ -528,6 +547,7 @@ Options:
   -p, --port <PORT>          Local service port to forward to [default: 3000]
   --host <HOST>              Local service host [default: 127.0.0.1]
   -t, --token <TOKEN>        Authentication token (JWT)
+  --api-key <API_KEY>        API key sent as x-api-key during the WebSocket handshake
   -v, --verbose              Enable verbose logging
   --connect-timeout <SECS>   Connection timeout in seconds [default: 10]
   --request-timeout <SECS>   Request timeout in seconds [default: 25]
@@ -535,8 +555,9 @@ Options:
 
 **Environment Variables**:
 
-- `TUNNEL_ENDPOINT`: Override default WebSocket endpoint
-- `TUNNEL_TOKEN`: Set authentication token
+- `TTF_ENDPOINT`: Override default WebSocket endpoint
+- `TTF_TOKEN`: Set authentication token
+- `TTF_API_KEY`: Set API key for the WebSocket handshake
 
 ### Infrastructure Configuration
 

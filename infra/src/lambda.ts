@@ -31,6 +31,7 @@ export function createLambdaHandler(
   role: aws.iam.Role,
   connectionsTableName: pulumi.Output<string>,
   pendingRequestsTableName: pulumi.Output<string>,
+  httpApiId: pulumi.Output<string>,
   websocketApiEndpoint: pulumi.Output<string>,
   eventBusName?: pulumi.Output<string>
 ): aws.lambda.Function {
@@ -49,21 +50,26 @@ export function createLambdaHandler(
       variables: pulumi.all([
         connectionsTableName,
         pendingRequestsTableName,
+        httpApiId,
         websocketApiEndpoint,
         eventBusName,
         jwtSecret,
         jwksSecret
-      ]).apply(([connTable, reqTable, wsEndpoint, busName, secret, jwks]) => {
+      ]).apply(([connTable, reqTable, httpApiIdValue, wsEndpoint, busName, secret, jwks]) => {
         const vars: Record<string, string> = {
           RUST_LOG: "info",
           CONNECTIONS_TABLE_NAME: connTable,
           PENDING_REQUESTS_TABLE_NAME: reqTable,
+          TUNNEL_ID_INDEX_NAME: "tunnel-id-index",
           DOMAIN_NAME: appConfig.domainName,
+          HTTP_API_ENDPOINT: `https://${httpApiIdValue}.execute-api.${appConfig.awsRegion}.amazonaws.com/${appConfig.environment}`,
           WEBSOCKET_API_ENDPOINT: wsEndpoint,
           EVENT_BUS_NAME: busName || `http-tunnel-events-${appConfig.environment}`,
           USE_EVENT_DRIVEN: appConfig.useEventDriven ? "true" : "false",
+          ENABLE_CUSTOM_DOMAIN: appConfig.enableCustomDomain ? "true" : "false",
           // Subdomain routing
-          ENABLE_SUBDOMAIN_ROUTING: appConfig.enableSubdomainRouting ? "true" : "false",
+          ENABLE_SUBDOMAIN_ROUTING:
+            appConfig.enableCustomDomain && appConfig.enableSubdomainRouting ? "true" : "false",
           // Authentication
           REQUIRE_AUTH: appConfig.requireAuth ? "true" : "false",
           JWT_SECRET: secret || process.env.JWT_SECRET || "default-secret-change-in-production",

@@ -10,13 +10,18 @@ use http_tunnel_common::{
     decode_body, encode_body, headers_to_map,
 };
 use reqwest::Client;
+use rustls::crypto::{CryptoProvider, ring};
 use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::sync::{Mutex, mpsc};
 use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message as WsMessage,
+    MaybeTlsStream, WebSocketStream, connect_async,
+    tungstenite::{
+        Message as WsMessage, client::IntoClientRequest, handshake::client::Request,
+        http::HeaderValue,
+    },
 };
 use tracing::{debug, error, info, warn};
 
@@ -49,6 +54,10 @@ struct Args {
     #[arg(short, long, env = "TTF_TOKEN")]
     token: Option<String>,
 
+    /// API key sent as x-api-key during the WebSocket handshake
+    #[arg(long, env = "TTF_API_KEY")]
+    api_key: Option<String>,
+
     /// Enable verbose logging
     #[arg(short, long)]
     verbose: bool,
@@ -73,6 +82,9 @@ pub struct Config {
 
     /// Authentication token (JWT)
     pub token: Option<String>,
+
+    /// API key sent as x-api-key during the WebSocket handshake
+    pub api_key: Option<String>,
 
     /// Connection timeout
     pub connect_timeout: Duration,
@@ -102,6 +114,7 @@ impl Config {
             local_address: format!("http://{}:{}", args.host, args.port),
             websocket_url: args.endpoint,
             token: args.token,
+            api_key: args.api_key,
             connect_timeout: Duration::from_secs(args.connect_timeout),
             request_timeout: Duration::from_secs(args.request_timeout),
             heartbeat_interval: Duration::from_secs(HEARTBEAT_INTERVAL_SECS),
@@ -113,6 +126,44 @@ impl Config {
             },
         }
     }
+}
+
+fn install_crypto_provider() -> Result<()> {
+    if CryptoProvider::get_default().is_none() {
+        ring::default_provider()
+            .install_default()
+            .map_err(|_| anyhow::anyhow!("failed to install rustls CryptoProvider"))?;
+    }
+
+    Ok(())
+}
+
+fn build_websocket_request(
+    websocket_url: &str,
+    token: Option<&str>,
+    api_key: Option<&str>,
+) -> Result<Request> {
+    let mut request = websocket_url
+        .into_client_request()
+        .map_err(|e| TunnelError::ConnectionError(format!("Invalid URL: {}", e)))?;
+
+    if let Some(token) = token {
+        request.headers_mut().insert(
+            "Authorization",
+            HeaderValue::from_str(&format!("Bearer {}", token))
+                .map_err(|e| TunnelError::ConnectionError(format!("Invalid token: {}", e)))?,
+        );
+    }
+
+    if let Some(api_key) = api_key {
+        request.headers_mut().insert(
+            "x-api-key",
+            HeaderValue::from_str(api_key)
+                .map_err(|e| TunnelError::ConnectionError(format!("Invalid API key: {}", e)))?,
+        );
+    }
+
+    Ok(request)
 }
 
 /// Connection state tracking
@@ -202,36 +253,25 @@ impl ConnectionManager {
     async fn establish_connection(&self) -> Result<(WebSocket, String)> {
         debug!("Connecting to {}", self.config.websocket_url);
 
-        // Build WebSocket request with optional auth token
-        let (mut ws_stream, _) = if let Some(ref token) = self.config.token {
-            // Use Authorization header for auth (works with both direct and custom domains)
-            use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-            use tokio_tungstenite::tungstenite::http::HeaderValue;
+        let request = build_websocket_request(
+            &self.config.websocket_url,
+            self.config.token.as_deref(),
+            self.config.api_key.as_deref(),
+        )?;
 
-            let mut request = self
-                .config
-                .websocket_url
-                .clone()
-                .into_client_request()
-                .map_err(|e| TunnelError::ConnectionError(format!("Invalid URL: {}", e)))?;
-
-            // Add token as Authorization header
-            request.headers_mut().insert(
-                "Authorization",
-                HeaderValue::from_str(&format!("Bearer {}", token))
-                    .map_err(|e| TunnelError::ConnectionError(format!("Invalid token: {}", e)))?,
-            );
-
+        if self.config.token.is_some() {
             debug!("Connecting with authentication token (Authorization header)");
-            connect_async(request)
-                .await
-                .map_err(|e| TunnelError::ConnectionError(e.to_string()))?
-        } else {
+        }
+        if self.config.api_key.is_some() {
+            debug!("Connecting with API key (x-api-key header)");
+        }
+        if self.config.token.is_none() && self.config.api_key.is_none() {
             debug!("Connecting without authentication");
-            connect_async(&self.config.websocket_url)
-                .await
-                .map_err(|e| TunnelError::ConnectionError(e.to_string()))?
-        };
+        }
+
+        let (mut ws_stream, _) = connect_async(request)
+            .await
+            .map_err(|e| TunnelError::ConnectionError(e.to_string()))?;
 
         info!("✅ WebSocket connection established, sending Ready message");
 
@@ -601,6 +641,8 @@ async fn spawn_heartbeat_task(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    install_crypto_provider()?;
+
     // Parse CLI arguments
     let args = Args::parse();
 
@@ -650,6 +692,7 @@ mod tests {
             host: "localhost".to_string(),
             endpoint: "wss://example.com".to_string(),
             token: None,
+            api_key: None,
             verbose: false,
             connect_timeout: 10,
             request_timeout: 25,
@@ -669,6 +712,7 @@ mod tests {
             host: "127.0.0.1".to_string(),
             endpoint: "wss://example.com".to_string(),
             token: Some("test_token_123".to_string()),
+            api_key: Some("api-key-123".to_string()),
             verbose: true,
             connect_timeout: 15,
             request_timeout: 30,
@@ -678,6 +722,7 @@ mod tests {
         assert_eq!(config.local_address, "http://127.0.0.1:3000");
         assert_eq!(config.websocket_url, "wss://example.com");
         assert_eq!(config.token, Some("test_token_123".to_string()));
+        assert_eq!(config.api_key, Some("api-key-123".to_string()));
         assert_eq!(config.connect_timeout, Duration::from_secs(15));
         assert_eq!(config.request_timeout, Duration::from_secs(30));
         assert_eq!(
@@ -693,6 +738,7 @@ mod tests {
             host: "127.0.0.1".to_string(),
             endpoint: "wss://example.com".to_string(),
             token: None,
+            api_key: None,
             verbose: false,
             connect_timeout: 10,
             request_timeout: 25,
@@ -732,5 +778,48 @@ mod tests {
             next_delay: Duration::from_secs(1),
         };
         assert!(matches!(state, ConnectionState::Reconnecting { .. }));
+    }
+
+    #[test]
+    fn test_build_websocket_request_without_auth_headers() {
+        let request = build_websocket_request("wss://example.com", None, None).unwrap();
+
+        assert!(request.headers().get("authorization").is_none());
+        assert!(request.headers().get("x-api-key").is_none());
+    }
+
+    #[test]
+    fn test_build_websocket_request_with_bearer_token() {
+        let request =
+            build_websocket_request("wss://example.com", Some("test_token_123"), None).unwrap();
+
+        assert_eq!(
+            request.headers().get("authorization").unwrap(),
+            "Bearer test_token_123"
+        );
+    }
+
+    #[test]
+    fn test_build_websocket_request_with_api_key() {
+        let request =
+            build_websocket_request("wss://example.com", None, Some("api-key-123")).unwrap();
+
+        assert_eq!(request.headers().get("x-api-key").unwrap(), "api-key-123");
+    }
+
+    #[test]
+    fn test_build_websocket_request_with_token_and_api_key() {
+        let request = build_websocket_request(
+            "wss://example.com",
+            Some("test_token_123"),
+            Some("api-key-123"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            request.headers().get("authorization").unwrap(),
+            "Bearer test_token_123"
+        );
+        assert_eq!(request.headers().get("x-api-key").unwrap(), "api-key-123");
     }
 }

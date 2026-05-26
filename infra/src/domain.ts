@@ -41,16 +41,61 @@ export function createCustomDomains(
     return undefined;
   }
 
-  if (!appConfig.certificateArn) {
-    throw new Error("Certificate ARN is required when custom domain is enabled");
+  if (!appConfig.certificateArn && !appConfig.hostedZoneId) {
+    throw new Error("Certificate ARN or hostedZoneId is required when custom domain is enabled");
   }
 
-  // HTTP API domain (for receiving forwarded requests)
-  const httpDomain = appConfig.domainName; // e.g., tunnel.sandbox.mydomain.io
+  const httpDomain = appConfig.domainName;
+  const websocketDomain = appConfig.websocketDomainName || `ws.${appConfig.domainName}`;
+
+  let certificateArn: pulumi.Input<string> = appConfig.certificateArn!;
+  if (!appConfig.certificateArn) {
+    const subjectAlternativeNames = appConfig.enableSubdomainRouting
+      ? [`*.${httpDomain}`]
+      : [websocketDomain];
+
+    const certificate = new aws.acm.Certificate("custom-domain-certificate", {
+      domainName: httpDomain,
+      subjectAlternativeNames,
+      validationMethod: "DNS",
+      tags: {
+        ...tags,
+        Name: "HTTP Tunnel Custom Domain Certificate",
+      },
+    });
+
+    const validationRecords = certificate.domainValidationOptions.apply((options) => {
+      const uniqueOptions = Array.from(
+        new Map(
+          options.map((option) => [
+            `${option.resourceRecordName}|${option.resourceRecordType}|${option.resourceRecordValue}`,
+            option,
+          ])
+        ).values()
+      );
+
+      return uniqueOptions.map((option, index) =>
+        new aws.route53.Record(`custom-domain-validation-${index}`, {
+          zoneId: appConfig.hostedZoneId!,
+          name: option.resourceRecordName,
+          type: option.resourceRecordType,
+          records: [option.resourceRecordValue],
+          ttl: 60,
+        })
+      );
+    });
+
+    const certificateValidation = new aws.acm.CertificateValidation("custom-domain-certificate-validation", {
+      certificateArn: certificate.arn,
+      validationRecordFqdns: validationRecords.apply((records) => records.map((record) => record.fqdn)),
+    });
+
+    certificateArn = certificateValidation.certificateArn;
+  }
   const httpDomainName = new aws.apigatewayv2.DomainName("http-custom-domain", {
     domainName: httpDomain,
     domainNameConfiguration: {
-      certificateArn: appConfig.certificateArn,
+      certificateArn,
       endpointType: "REGIONAL",
       securityPolicy: "TLS_1_2",
     },
@@ -66,14 +111,10 @@ export function createCustomDomains(
     stage: httpStageId,
   });
 
-  // WebSocket API domain (for agent connections)
-  // Use configured websocketDomainName or derive from domainName
-  const websocketDomain = appConfig.websocketDomainName
-    || `ws.${appConfig.domainName.split('.').slice(1).join('.')}`; // e.g., ws.sandbox.mydomain.io
   const websocketDomainName = new aws.apigatewayv2.DomainName("websocket-custom-domain", {
     domainName: websocketDomain,
     domainNameConfiguration: {
-      certificateArn: appConfig.certificateArn,
+      certificateArn,
       endpointType: "REGIONAL",
       securityPolicy: "TLS_1_2",
     },
@@ -138,7 +179,7 @@ export function createCustomDomains(
     wildcardDomainName = new aws.apigatewayv2.DomainName("wildcard-custom-domain", {
       domainName: wildcardDomain,
       domainNameConfiguration: {
-        certificateArn: appConfig.certificateArn,
+        certificateArn,
         endpointType: "REGIONAL",
         securityPolicy: "TLS_1_2",
       },

@@ -8,7 +8,7 @@
 use anyhow::{Context, Result};
 
 /// Default GSI index name for tunnel ID lookups
-const DEFAULT_TUNNEL_ID_INDEX_NAME: &str = "tunnelId-index";
+const DEFAULT_TUNNEL_ID_INDEX_NAME: &str = "tunnel-id-index";
 
 /// Get the connections table name from environment variables.
 ///

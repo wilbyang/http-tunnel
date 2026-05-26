@@ -55,7 +55,7 @@ export function createLambdaRole(
             Sid: "DynamoDBConnectionsTableGSI",
             Effect: "Allow",
             Action: ["dynamodb:Query"],
-            Resource: `${connTableArn}/index/tunnel-id-index`,
+            Resource: [connTableArn, `${connTableArn}/index/*`],
           },
           {
             Sid: "DynamoDBPendingRequestsTable",

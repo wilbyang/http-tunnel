@@ -1,0 +1,14 @@
+encryptionsalt: v1:KCOS2nLtS8I=:v1:o6mYimlz0Bz/RAmN:EU6yBAQyM/EQwc9NDUupMArKKSxbFA==
+config:
+  aws:region: eu-west-1
+  aws:profile: mine
+  http-tunnel:environment: dev
+  http-tunnel:lambdaArchitecture: arm64
+  http-tunnel:lambdaMemorySize: "256"
+  http-tunnel:lambdaTimeout: "30"
+  http-tunnel:enableCustomDomain: "true"
+  http-tunnel:domainName: xxhh.click
+  http-tunnel:websocketDomainName: ws.xxhh.click
+  http-tunnel:hostedZoneId: Z00822932GKA9H8VPA8QB
+  http-tunnel:enableSubdomainRouting: "true"
+  http-tunnel:certificateArn: arn:aws:acm:eu-west-1:647420212900:certificate/217c4288-9732-47fe-a5d9-ca2317ba1be1

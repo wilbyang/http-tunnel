@@ -17,6 +17,7 @@ use http_tunnel_handler::handlers::{
 };
 use http_tunnel_handler::http_api::HttpApiRequest;
 use lambda_runtime::{Error, LambdaEvent, run, service_fn};
+use rustls::crypto::{CryptoProvider, ring};
 use serde_json::Value;
 use tracing::{debug, info};
 
@@ -155,8 +156,20 @@ async fn function_handler(
 
 use serde_json::json;
 
+fn install_crypto_provider() -> Result<(), Error> {
+    if CryptoProvider::get_default().is_none() {
+        ring::default_provider()
+            .install_default()
+            .map_err(|_| "failed to install rustls CryptoProvider")?;
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Error> {
+    install_crypto_provider()?;
+
     // Initialize tracing subscriber for CloudWatch Logs
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
