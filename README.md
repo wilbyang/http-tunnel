@@ -69,6 +69,9 @@ cargo install --git https://github.com/tyrchen/http-tunnel --bin ttf
 # Deploy AWS infrastructure (Lambda, API Gateway, DynamoDB)
 make deploy-infra
 
+# Use a different Pulumi stack or passphrase-protected stack
+make deploy-infra PULUMI_STACK=prod PULUMI_CONFIG_PASSPHRASE=your-passphrase
+
 # Note the WebSocket endpoint from the output
 ```
 
@@ -407,6 +410,20 @@ ttf --api-key YOUR_API_KEY
 ttf --token YOUR_JWT --api-key YOUR_API_KEY
 ```
 
+### With Requested Tunnel ID
+
+```bash
+# Request a specific tunnel ID instead of letting the server generate one
+ttf --tunnel-id abc123def456
+
+# Combine it with endpoint and auth settings
+ttf --endpoint wss://YOUR_WEBSOCKET_ENDPOINT --tunnel-id abc123def456 --api-key YOUR_API_KEY
+```
+
+`--tunnel-id` requests the public tunnel identifier. The actual WebSocket `connection_id`
+is still assigned by API Gateway. Requested tunnel IDs must match the current validation
+rules: exactly 12 lowercase alphanumeric characters.
+
 ### Environment Variables
 
 ```bash
@@ -418,6 +435,9 @@ export TTF_TOKEN=your_jwt_token
 
 # Set API key for the WebSocket handshake
 export TTF_API_KEY=your_api_key
+
+# Request a specific tunnel ID
+export TTF_TUNNEL_ID=abc123def456
 
 # Run with environment configuration
 ttf
@@ -514,6 +534,8 @@ make deploy-infra
 make destroy-infra
 ```
 
+By default, these targets use the Pulumi `dev` stack. Override `PULUMI_STACK` and `PULUMI_CONFIG_PASSPHRASE` when you want to use a different or passphrase-protected stack.
+
 ### Custom Domain Setup
 
 To use your own domain instead of API Gateway URLs:
@@ -548,6 +570,7 @@ Options:
   --host <HOST>              Local service host [default: 127.0.0.1]
   -t, --token <TOKEN>        Authentication token (JWT)
   --api-key <API_KEY>        API key sent as x-api-key during the WebSocket handshake
+  --tunnel-id <TUNNEL_ID>    Request a specific tunnel ID (12 lowercase alphanumeric chars)
   -v, --verbose              Enable verbose logging
   --connect-timeout <SECS>   Connection timeout in seconds [default: 10]
   --request-timeout <SECS>   Request timeout in seconds [default: 25]
@@ -558,6 +581,7 @@ Options:
 - `TTF_ENDPOINT`: Override default WebSocket endpoint
 - `TTF_TOKEN`: Set authentication token
 - `TTF_API_KEY`: Set API key for the WebSocket handshake
+- `TTF_TUNNEL_ID`: Request a specific tunnel ID
 
 ### Infrastructure Configuration
 

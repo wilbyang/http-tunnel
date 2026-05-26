@@ -1,0 +1,2 @@
+[env]
+CARGO_ZIGBUILD_ZIG_PATH = { value = "scripts/zig-with-ulimit.sh", relative = true }

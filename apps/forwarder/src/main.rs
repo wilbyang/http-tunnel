@@ -58,6 +58,10 @@ struct Args {
     #[arg(long, env = "TTF_API_KEY")]
     api_key: Option<String>,
 
+    /// Requested tunnel ID to reuse instead of generating a random one
+    #[arg(long, env = "TTF_TUNNEL_ID")]
+    tunnel_id: Option<String>,
+
     /// Enable verbose logging
     #[arg(short, long)]
     verbose: bool,
@@ -85,6 +89,9 @@ pub struct Config {
 
     /// API key sent as x-api-key during the WebSocket handshake
     pub api_key: Option<String>,
+
+    /// Requested tunnel ID to reuse instead of generating a random one
+    pub tunnel_id: Option<String>,
 
     /// Connection timeout
     pub connect_timeout: Duration,
@@ -115,6 +122,7 @@ impl Config {
             websocket_url: args.endpoint,
             token: args.token,
             api_key: args.api_key,
+            tunnel_id: args.tunnel_id,
             connect_timeout: Duration::from_secs(args.connect_timeout),
             request_timeout: Duration::from_secs(args.request_timeout),
             heartbeat_interval: Duration::from_secs(HEARTBEAT_INTERVAL_SECS),
@@ -142,7 +150,17 @@ fn build_websocket_request(
     websocket_url: &str,
     token: Option<&str>,
     api_key: Option<&str>,
+    tunnel_id: Option<&str>,
 ) -> Result<Request> {
+    let websocket_url = if let Some(tunnel_id) = tunnel_id {
+        let mut url = url::Url::parse(websocket_url)
+            .map_err(|e| TunnelError::ConnectionError(format!("Invalid URL: {}", e)))?;
+        url.query_pairs_mut().append_pair("tunnel_id", tunnel_id);
+        url.into()
+    } else {
+        websocket_url.to_string()
+    };
+
     let mut request = websocket_url
         .into_client_request()
         .map_err(|e| TunnelError::ConnectionError(format!("Invalid URL: {}", e)))?;
@@ -257,6 +275,7 @@ impl ConnectionManager {
             &self.config.websocket_url,
             self.config.token.as_deref(),
             self.config.api_key.as_deref(),
+            self.config.tunnel_id.as_deref(),
         )?;
 
         if self.config.token.is_some() {
@@ -264,6 +283,9 @@ impl ConnectionManager {
         }
         if self.config.api_key.is_some() {
             debug!("Connecting with API key (x-api-key header)");
+        }
+        if let Some(tunnel_id) = self.config.tunnel_id.as_deref() {
+            debug!("Requesting tunnel ID {}", tunnel_id);
         }
         if self.config.token.is_none() && self.config.api_key.is_none() {
             debug!("Connecting without authentication");
@@ -693,6 +715,7 @@ mod tests {
             endpoint: "wss://example.com".to_string(),
             token: None,
             api_key: None,
+            tunnel_id: None,
             verbose: false,
             connect_timeout: 10,
             request_timeout: 25,
@@ -713,6 +736,7 @@ mod tests {
             endpoint: "wss://example.com".to_string(),
             token: Some("test_token_123".to_string()),
             api_key: Some("api-key-123".to_string()),
+            tunnel_id: Some("abc123def456".to_string()),
             verbose: true,
             connect_timeout: 15,
             request_timeout: 30,
@@ -723,6 +747,7 @@ mod tests {
         assert_eq!(config.websocket_url, "wss://example.com");
         assert_eq!(config.token, Some("test_token_123".to_string()));
         assert_eq!(config.api_key, Some("api-key-123".to_string()));
+        assert_eq!(config.tunnel_id, Some("abc123def456".to_string()));
         assert_eq!(config.connect_timeout, Duration::from_secs(15));
         assert_eq!(config.request_timeout, Duration::from_secs(30));
         assert_eq!(
@@ -739,6 +764,7 @@ mod tests {
             endpoint: "wss://example.com".to_string(),
             token: None,
             api_key: None,
+            tunnel_id: None,
             verbose: false,
             connect_timeout: 10,
             request_timeout: 25,
@@ -782,7 +808,7 @@ mod tests {
 
     #[test]
     fn test_build_websocket_request_without_auth_headers() {
-        let request = build_websocket_request("wss://example.com", None, None).unwrap();
+        let request = build_websocket_request("wss://example.com", None, None, None).unwrap();
 
         assert!(request.headers().get("authorization").is_none());
         assert!(request.headers().get("x-api-key").is_none());
@@ -791,7 +817,8 @@ mod tests {
     #[test]
     fn test_build_websocket_request_with_bearer_token() {
         let request =
-            build_websocket_request("wss://example.com", Some("test_token_123"), None).unwrap();
+            build_websocket_request("wss://example.com", Some("test_token_123"), None, None)
+                .unwrap();
 
         assert_eq!(
             request.headers().get("authorization").unwrap(),
@@ -802,7 +829,7 @@ mod tests {
     #[test]
     fn test_build_websocket_request_with_api_key() {
         let request =
-            build_websocket_request("wss://example.com", None, Some("api-key-123")).unwrap();
+            build_websocket_request("wss://example.com", None, Some("api-key-123"), None).unwrap();
 
         assert_eq!(request.headers().get("x-api-key").unwrap(), "api-key-123");
     }
@@ -813,6 +840,7 @@ mod tests {
             "wss://example.com",
             Some("test_token_123"),
             Some("api-key-123"),
+            None,
         )
         .unwrap();
 
@@ -821,5 +849,16 @@ mod tests {
             "Bearer test_token_123"
         );
         assert_eq!(request.headers().get("x-api-key").unwrap(), "api-key-123");
+    }
+
+    #[test]
+    fn test_build_websocket_request_with_tunnel_id_query_param() {
+        let request =
+            build_websocket_request("wss://example.com", None, None, Some("abc123def456")).unwrap();
+
+        assert_eq!(
+            request.uri().to_string(),
+            "wss://example.com/?tunnel_id=abc123def456"
+        );
     }
 }

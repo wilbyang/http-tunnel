@@ -29,3 +29,6 @@ tracing = "0.1"
 
 # Workspace crates
 http-tunnel-common = { path = "crates/common", version = "0.3.3" }
+
+[profile.release]
+codegen-units = 1

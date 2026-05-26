@@ -5,13 +5,16 @@
 //! returns a success response.
 
 use aws_lambda_events::apigw::{ApiGatewayProxyResponse, ApiGatewayWebsocketProxyRequest};
+use aws_sdk_dynamodb::Client as DynamoDbClient;
+use aws_sdk_dynamodb::types::AttributeValue;
 use http_tunnel_common::ConnectionMetadata;
 use http_tunnel_common::constants::CONNECTION_TTL_SECS;
 use http_tunnel_common::utils::{calculate_ttl, current_timestamp_secs, generate_subdomain};
+use http_tunnel_common::validation::validate_tunnel_id;
 use lambda_runtime::{Error, LambdaEvent};
 use tracing::{error, info};
 
-use crate::{SharedClients, auth, error_handling::sanitize_error, save_connection_metadata};
+use crate::{SharedClients, auth, env, error_handling::sanitize_error, save_connection_metadata};
 
 fn is_enabled(var_name: &str, default: bool) -> bool {
     std::env::var(var_name)
@@ -45,14 +48,50 @@ fn build_public_urls(tunnel_id: &str) -> (String, Option<String>, String) {
     (public_url, subdomain_url, path_based_url)
 }
 
+fn requested_tunnel_id(
+    request: &ApiGatewayWebsocketProxyRequest,
+) -> Result<Option<String>, String> {
+    let Some(tunnel_id) = request.query_string_parameters.first("tunnel_id") else {
+        return Ok(None);
+    };
+
+    validate_tunnel_id(tunnel_id).map_err(|e| format!("Invalid tunnel_id: {}", e))?;
+
+    Ok(Some(tunnel_id.to_string()))
+}
+
+async fn tunnel_id_exists(client: &DynamoDbClient, tunnel_id: &str) -> Result<bool, Error> {
+    let table_name = env::get_connections_table_name().map_err(|e| format!("{}", e))?;
+    let index_name = env::get_tunnel_id_index_name();
+
+    let result = client
+        .query()
+        .table_name(table_name)
+        .index_name(index_name)
+        .key_condition_expression("tunnelId = :tunnel_id")
+        .expression_attribute_values(":tunnel_id", AttributeValue::S(tunnel_id.to_string()))
+        .limit(1)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to check tunnel_id availability: {}", e))?;
+
+    Ok(result
+        .items
+        .as_ref()
+        .map(|items| !items.is_empty())
+        .unwrap_or(false))
+}
+
 /// Handler for WebSocket $connect route
 pub async fn handle_connect(
     event: LambdaEvent<ApiGatewayWebsocketProxyRequest>,
     clients: &SharedClients,
 ) -> Result<ApiGatewayProxyResponse, Error> {
+    use aws_lambda_events::encodings::Body;
+    let payload = event.payload;
+
     // Authenticate request if auth is enabled (before extracting connection_id)
-    if let Err(e) = auth::authenticate_request(&event.payload) {
-        use aws_lambda_events::encodings::Body;
+    if let Err(e) = auth::authenticate_request(&payload) {
         error!("Authentication failed: {}", e);
         let mut response = ApiGatewayProxyResponse::default();
         response.status_code = 401;
@@ -60,15 +99,37 @@ pub async fn handle_connect(
         return Ok(response);
     }
 
-    let request_context = event.payload.request_context;
+    let requested_tunnel_id = requested_tunnel_id(&payload);
+    let request_context = payload.request_context;
     let connection_id = request_context
         .connection_id
         .ok_or("Missing connection ID")?;
 
     info!("New WebSocket connection: {}", connection_id);
 
-    // Generate unique tunnel ID (path segment)
-    let tunnel_id = generate_subdomain(); // Reusing subdomain generator for random ID
+    let tunnel_id = match requested_tunnel_id {
+        Ok(Some(tunnel_id)) => {
+            if tunnel_id_exists(&clients.dynamodb, &tunnel_id).await? {
+                let mut response = ApiGatewayProxyResponse::default();
+                response.status_code = 409;
+                response.body = Some(Body::Text(
+                    "Requested tunnel_id is already in use".to_string(),
+                ));
+                return Ok(response);
+            }
+
+            info!("Using requested tunnel_id: {}", tunnel_id);
+            tunnel_id
+        }
+        Ok(None) => generate_subdomain(),
+        Err(e) => {
+            let mut response = ApiGatewayProxyResponse::default();
+            response.status_code = 400;
+            response.body = Some(Body::Text(e));
+            return Ok(response);
+        }
+    };
+
     let (public_url, subdomain_url, path_based_url) = build_public_urls(&tunnel_id);
 
     // Calculate TTL (2 hours from now)
@@ -117,8 +178,10 @@ pub async fn handle_connect(
 
 #[cfg(test)]
 mod tests {
-    use super::build_public_urls;
+    use super::{build_public_urls, requested_tunnel_id};
+    use aws_lambda_events::{apigw::ApiGatewayWebsocketProxyRequest, query_map::QueryMap};
     use http_tunnel_common::utils::generate_subdomain;
+    use std::collections::HashMap;
 
     #[test]
     fn test_subdomain_format() {
@@ -156,5 +219,37 @@ mod tests {
             "https://api-id.execute-api.eu-west-1.amazonaws.com/dev/abc123def456"
         );
         assert_eq!(subdomain_url, None);
+    }
+
+    #[test]
+    fn test_requested_tunnel_id_missing() {
+        let request = ApiGatewayWebsocketProxyRequest::default();
+
+        assert_eq!(requested_tunnel_id(&request).unwrap(), None);
+    }
+
+    #[test]
+    fn test_requested_tunnel_id_valid() {
+        let mut query_params = HashMap::new();
+        query_params.insert("tunnel_id".to_string(), "abc123def456".to_string());
+
+        let mut request = ApiGatewayWebsocketProxyRequest::default();
+        request.query_string_parameters = QueryMap::from(query_params);
+
+        assert_eq!(
+            requested_tunnel_id(&request).unwrap(),
+            Some("abc123def456".to_string())
+        );
+    }
+
+    #[test]
+    fn test_requested_tunnel_id_invalid() {
+        let mut query_params = HashMap::new();
+        query_params.insert("tunnel_id".to_string(), "invalid-id".to_string());
+
+        let mut request = ApiGatewayWebsocketProxyRequest::default();
+        request.query_string_parameters = QueryMap::from(query_params);
+
+        assert!(requested_tunnel_id(&request).is_err());
     }
 }
