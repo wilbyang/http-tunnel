@@ -628,8 +628,10 @@ async fn handle_http_request(
                 vec![Message::HttpResponse(http_response)]
             };
 
-            // Send all messages (either single response or multiple chunks)
-            for msg in messages_to_send {
+            // Send all messages. For chunked responses, pace at 80ms per message to avoid
+            // overwhelming API Gateway and triggering Lambda concurrent-invocation throttling.
+            let total = messages_to_send.len();
+            for (i, msg) in messages_to_send.into_iter().enumerate() {
                 let response_json = serde_json::to_string(&msg)
                     .map_err(|e| TunnelError::InvalidMessage(e.to_string()))?;
 
@@ -637,6 +639,11 @@ async fn handle_http_request(
                     .send(WsMessage::Text(response_json.into()))
                     .await
                     .map_err(|e| TunnelError::WebSocketError(e.to_string()))?;
+
+                // Pace chunk delivery — skip delay after the last message
+                if total > 1 && i + 1 < total {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(80)).await;
+                }
             }
         }
         Err(e) => {

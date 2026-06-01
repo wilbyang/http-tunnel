@@ -169,8 +169,10 @@ async fn handle_http_response(
 
 /// Handle response chunk from agent.
 ///
-/// Stores the chunk on the existing DynamoDB item. When all chunks are stored,
-/// reassembles the full response and marks the request as completed.
+/// Stores the chunk using an atomic counter. When the counter reaches `total_chunks`,
+/// this Lambda invocation reassembles the full response and marks it completed.
+/// Using a counter (rather than checking chunk_index == last) means ANY Lambda
+/// invocation — regardless of delivery order — can be the one that completes the set.
 async fn handle_response_chunk(
     client: &DynamoDbClient,
     request_id: &str,
@@ -180,31 +182,35 @@ async fn handle_response_chunk(
 ) -> Result<(), Error> {
     use crate::{get_and_reassemble_chunks, store_response_chunk};
 
-    // Store this chunk as an attribute on the request item
-    store_response_chunk(client, request_id, chunk_index, chunk_data)
+    let stored_count = store_response_chunk(client, request_id, chunk_index, chunk_data)
         .await
         .map_err(|e| {
             error!("Failed to store response chunk: {}", e);
             format!("Failed to store response chunk: {}", e)
         })?;
 
-    // When the last chunk arrives, reassemble and complete the request
-    if chunk_index == total_chunks - 1 {
-        debug!(
-            "Last chunk ({}/{}) received for {}, reassembling",
-            chunk_index + 1,
-            total_chunks,
-            request_id
-        );
+    debug!(
+        "Chunk {}/{} stored for {} (count now {})",
+        chunk_index + 1,
+        total_chunks,
+        request_id,
+        stored_count
+    );
+
+    // When the atomic count equals total_chunks, all chunks have been received
+    // (regardless of the order they arrived in).
+    if stored_count == total_chunks {
+        debug!("All {} chunks received for {}, reassembling", total_chunks, request_id);
 
         match get_and_reassemble_chunks(client, request_id, total_chunks).await {
             Ok(Some(_)) => {
                 debug!("Successfully reassembled response for {}", request_id);
             }
             Ok(None) => {
+                // Shouldn't happen if counter is correct, but log for visibility
                 warn!(
-                    "Could not reassemble chunks for {} — some may be missing",
-                    request_id
+                    "Counter reached {} but reassembly returned None for {} — metadata may be missing",
+                    total_chunks, request_id
                 );
             }
             Err(e) => {

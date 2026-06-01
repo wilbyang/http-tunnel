@@ -12,7 +12,7 @@ use anyhow::{Context, Result, anyhow};
 use aws_sdk_apigatewaymanagement::Client as ApiGatewayManagementClient;
 use aws_sdk_apigatewaymanagement::primitives::Blob;
 use aws_sdk_dynamodb::Client as DynamoDbClient;
-use aws_sdk_dynamodb::types::AttributeValue;
+use aws_sdk_dynamodb::types::{AttributeValue, ReturnValue};
 use aws_sdk_eventbridge::Client as EventBridgeClient;
 use http_tunnel_common::ConnectionMetadata;
 use http_tunnel_common::constants::{
@@ -621,32 +621,52 @@ pub async fn store_chunked_response_metadata(
 
 /// Store a response chunk as an attribute on the existing pending request item.
 ///
-/// Each chunk is stored as attribute `chunk_<N>` on the item keyed by `requestId`.
-/// The table has no sort key, so all updates are to the single item for this request.
+/// Uses an atomic `ADD chunkCount :1` so that any Lambda invocation — regardless
+/// of which chunk index it holds — can tell when all chunks have been received by
+/// comparing the returned count to `total_chunks`. This avoids the race condition
+/// where the "last chunk by index" Lambda runs before earlier Lambdas have stored
+/// their data.
+///
+/// Returns the new chunk count after this write.
 pub async fn store_response_chunk(
     client: &DynamoDbClient,
     request_id: &str,
     chunk_index: u32,
     chunk_data: String,
-) -> Result<()> {
+) -> Result<u32> {
     let table_name = env::get_pending_requests_table_name()?;
     let attr_name = format!("chunk_{}", chunk_index);
     let expr_attr_name = format!("#chunk_{}", chunk_index);
 
-    client
+    let result = client
         .update_item()
         .table_name(&table_name)
         .key("requestId", AttributeValue::S(request_id.to_string()))
-        .update_expression(format!("SET {} = :data", expr_attr_name))
+        .update_expression(format!(
+            "SET {} = :data ADD chunkCount :one",
+            expr_attr_name
+        ))
         .expression_attribute_names(expr_attr_name, attr_name)
         .expression_attribute_values(":data", AttributeValue::S(chunk_data))
+        .expression_attribute_values(":one", AttributeValue::N("1".to_string()))
+        .return_values(ReturnValue::UpdatedNew)
         .send()
         .await
         .context("Failed to store response chunk")?;
 
-    debug!("Stored chunk {} for request {}", chunk_index, request_id);
+    let count = result
+        .attributes()
+        .and_then(|attrs| attrs.get("chunkCount"))
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<u32>().ok())
+        .unwrap_or(0);
 
-    Ok(())
+    debug!(
+        "Stored chunk {} for request {}, count now {}/{}",
+        chunk_index, request_id, count, "?"
+    );
+
+    Ok(count)
 }
 
 /// Retrieve the item, reassemble body from chunk_0..chunk_N attributes, and mark completed.
