@@ -12,7 +12,7 @@ use anyhow::{Context, Result, anyhow};
 use aws_sdk_apigatewaymanagement::Client as ApiGatewayManagementClient;
 use aws_sdk_apigatewaymanagement::primitives::Blob;
 use aws_sdk_dynamodb::Client as DynamoDbClient;
-use aws_sdk_dynamodb::types::{AttributeValue, ReturnValue};
+use aws_sdk_dynamodb::types::AttributeValue;
 use aws_sdk_eventbridge::Client as EventBridgeClient;
 use http_tunnel_common::ConnectionMetadata;
 use http_tunnel_common::constants::{
@@ -578,150 +578,6 @@ pub async fn update_pending_request_with_response(
     Ok(())
 }
 
-/// Store chunked response metadata (header message) as "chunked_pending".
-///
-/// Called when `HttpResponse` with `total_chunks > 0` arrives. The body is empty;
-/// body data will arrive in separate `ResponseChunk` messages.
-pub async fn store_chunked_response_metadata(
-    client: &DynamoDbClient,
-    response: &HttpResponse,
-    total_chunks: u32,
-) -> Result<()> {
-    let table_name = env::get_pending_requests_table_name()?;
-
-    // Serialize the metadata (with empty body) for later use during reassembly
-    let response_data =
-        serde_json::to_string(response).context("Failed to serialize response metadata")?;
-
-    client
-        .update_item()
-        .table_name(&table_name)
-        .key("requestId", AttributeValue::S(response.request_id.clone()))
-        .update_expression(
-            "SET #status = :status, responseData = :data, totalChunks = :total",
-        )
-        .expression_attribute_names("#status", "status")
-        .expression_attribute_values(":status", AttributeValue::S("chunked_pending".to_string()))
-        .expression_attribute_values(":data", AttributeValue::S(response_data))
-        .expression_attribute_values(
-            ":total",
-            AttributeValue::N(total_chunks.to_string()),
-        )
-        .send()
-        .await
-        .context("Failed to store chunked response metadata")?;
-
-    debug!(
-        "Stored chunked metadata for {}, expecting {} chunks",
-        response.request_id, total_chunks
-    );
-
-    Ok(())
-}
-
-/// Store a response chunk as an attribute on the existing pending request item.
-///
-/// Uses an atomic `ADD chunkCount :1` so that any Lambda invocation — regardless
-/// of which chunk index it holds — can tell when all chunks have been received by
-/// comparing the returned count to `total_chunks`. This avoids the race condition
-/// where the "last chunk by index" Lambda runs before earlier Lambdas have stored
-/// their data.
-///
-/// Returns the new chunk count after this write.
-pub async fn store_response_chunk(
-    client: &DynamoDbClient,
-    request_id: &str,
-    chunk_index: u32,
-    chunk_data: String,
-) -> Result<u32> {
-    let table_name = env::get_pending_requests_table_name()?;
-    let attr_name = format!("chunk_{}", chunk_index);
-    let expr_attr_name = format!("#chunk_{}", chunk_index);
-
-    let result = client
-        .update_item()
-        .table_name(&table_name)
-        .key("requestId", AttributeValue::S(request_id.to_string()))
-        .update_expression(format!(
-            "SET {} = :data ADD chunkCount :one",
-            expr_attr_name
-        ))
-        .expression_attribute_names(expr_attr_name, attr_name)
-        .expression_attribute_values(":data", AttributeValue::S(chunk_data))
-        .expression_attribute_values(":one", AttributeValue::N("1".to_string()))
-        .return_values(ReturnValue::UpdatedNew)
-        .send()
-        .await
-        .context("Failed to store response chunk")?;
-
-    let count = result
-        .attributes()
-        .and_then(|attrs| attrs.get("chunkCount"))
-        .and_then(|v| v.as_n().ok())
-        .and_then(|n| n.parse::<u32>().ok())
-        .unwrap_or(0);
-
-    debug!(
-        "Stored chunk {} for request {}, count now {}/{}",
-        chunk_index, request_id, count, "?"
-    );
-
-    Ok(count)
-}
-
-/// Retrieve the item, reassemble body from chunk_0..chunk_N attributes, and mark completed.
-///
-/// Returns the completed HttpResponse with reassembled body, or None if any chunk is missing.
-pub async fn get_and_reassemble_chunks(
-    client: &DynamoDbClient,
-    request_id: &str,
-    total_chunks: u32,
-) -> Result<Option<HttpResponse>> {
-    let table_name = env::get_pending_requests_table_name()?;
-
-    let result = client
-        .get_item()
-        .table_name(&table_name)
-        .key("requestId", AttributeValue::S(request_id.to_string()))
-        .send()
-        .await
-        .context("Failed to get pending request item")?;
-
-    let item = match result.item {
-        Some(item) => item,
-        None => return Ok(None),
-    };
-
-    // Read metadata stored when the HttpResponse header arrived
-    let response_data = match item.get("responseData").and_then(|v| v.as_s().ok()) {
-        Some(d) => d,
-        None => return Ok(None),
-    };
-    let mut response: HttpResponse =
-        serde_json::from_str(response_data).context("Failed to parse response metadata")?;
-
-    // Collect and concatenate all chunk_N attributes in order
-    let mut body = String::new();
-    for i in 0..total_chunks {
-        let attr_name = format!("chunk_{}", i);
-        match item.get(&attr_name).and_then(|v| v.as_s().ok()) {
-            Some(data) => body.push_str(data),
-            None => {
-                debug!("Chunk {} not yet available for request {}", i, request_id);
-                return Ok(None);
-            }
-        }
-    }
-
-    response.body = body;
-    response.total_chunks = None; // Clear the flag; body is now complete
-
-    // Update item to completed with assembled response
-    update_pending_request_with_response(client, &response).await?;
-
-    Ok(Some(response))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -822,7 +678,6 @@ mod tests {
             headers,
             body: "eyJ0ZXN0IjoidmFsdWUifQ==".to_string(),
             processing_time_ms: 123,
-            total_chunks: None,
         };
 
         let apigw_response = build_api_gateway_response(http_api::ApiGatewayVersion::V1, response);
@@ -854,7 +709,6 @@ mod tests {
             headers,
             body: "eyJ0ZXN0IjoidmFsdWUifQ==".to_string(),
             processing_time_ms: 123,
-            total_chunks: None,
         };
 
         let apigw_response = build_api_gateway_response(http_api::ApiGatewayVersion::V2, response);
@@ -880,7 +734,6 @@ mod tests {
             headers: HashMap::new(),
             body: String::new(),
             processing_time_ms: 0,
-            total_chunks: None,
         };
 
         // Test both versions

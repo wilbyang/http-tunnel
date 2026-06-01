@@ -26,18 +26,6 @@ pub enum Message {
     HttpRequest(HttpRequest),
     HttpResponse(HttpResponse),
 
-    /// Chunked response body for large responses (to work around 32KB API Gateway limit)
-    /// When a response body is too large to fit in a single message, it's split into chunks
-    ResponseChunk {
-        request_id: String,
-        /// Sequential chunk index (0-based)
-        chunk_index: u32,
-        /// Total number of chunks for this response
-        total_chunks: u32,
-        /// Base64-encoded chunk data
-        chunk_data: String,
-    },
-
     /// Error handling
     Error {
         request_id: Option<String>,

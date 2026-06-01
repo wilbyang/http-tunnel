@@ -3,7 +3,7 @@ use clap::Parser;
 use futures_util::{SinkExt, StreamExt, stream::SplitSink, stream::SplitStream};
 use http_tunnel_common::{
     ErrorCode, HttpRequest, HttpResponse, Message, TunnelError,
-    chunking, constants::{
+    constants::{
         HEARTBEAT_INTERVAL_SECS, RECONNECT_MAX_DELAY_MS, RECONNECT_MIN_DELAY_MS,
         RECONNECT_MULTIPLIER,
     },
@@ -474,15 +474,8 @@ async fn handle_text_message(
     local_address: &str,
     request_timeout: Duration,
 ) -> Result<()> {
-    let message: Message = match serde_json::from_str(text) {
-        Ok(m) => m,
-        Err(e) => {
-            // API Gateway may send non-tunnel JSON (e.g. error envelopes).
-            // Log and skip rather than crashing the read loop.
-            warn!("Ignoring non-tunnel message ({}): {}", e, &text[..text.len().min(200)]);
-            return Ok(());
-        }
-    };
+    let message: Message = serde_json::from_str(text)
+        .map_err(|e| TunnelError::InvalidMessage(format!("Failed to parse message: {}", e)))?;
 
     match message {
         Message::ConnectionEstablished {
@@ -617,34 +610,16 @@ async fn handle_http_request(
                 headers,
                 body,
                 processing_time_ms: processing_time,
-                total_chunks: None,
             };
 
-            // Use chunking for large responses to work around 32KB API Gateway limit
-            let messages_to_send = if chunking::should_chunk_response(&http_response) {
-                debug!("Response body large, splitting into chunks");
-                chunking::chunk_response(http_response)
-            } else {
-                vec![Message::HttpResponse(http_response)]
-            };
+            let response_message = Message::HttpResponse(http_response);
+            let response_json = serde_json::to_string(&response_message)
+                .map_err(|e| TunnelError::InvalidMessage(e.to_string()))?;
 
-            // Send all messages. For chunked responses, pace at 80ms per message to avoid
-            // overwhelming API Gateway and triggering Lambda concurrent-invocation throttling.
-            let total = messages_to_send.len();
-            for (i, msg) in messages_to_send.into_iter().enumerate() {
-                let response_json = serde_json::to_string(&msg)
-                    .map_err(|e| TunnelError::InvalidMessage(e.to_string()))?;
-
-                outgoing_tx
-                    .send(WsMessage::Text(response_json.into()))
-                    .await
-                    .map_err(|e| TunnelError::WebSocketError(e.to_string()))?;
-
-                // Pace chunk delivery — skip delay after the last message
-                if total > 1 && i + 1 < total {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(80)).await;
-                }
-            }
+            outgoing_tx
+                .send(WsMessage::Text(response_json.into()))
+                .await
+                .map_err(|e| TunnelError::WebSocketError(e.to_string()))?;
         }
         Err(e) => {
             error!("Local service error: {}", e);

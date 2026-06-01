@@ -20,11 +20,6 @@ pub struct HttpResponse {
     /// Processing time in milliseconds (local service response time)
     #[serde(default)]
     pub processing_time_ms: u64,
-
-    /// When set, indicates the body is split into this many ResponseChunk messages
-    /// that follow this HttpResponse. The body field will be empty in this case.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub total_chunks: Option<u32>,
 }
 
 impl HttpResponse {
@@ -36,7 +31,6 @@ impl HttpResponse {
             headers: HashMap::new(),
             body: String::new(),
             processing_time_ms: 0,
-            total_chunks: None,
         }
     }
 
@@ -109,7 +103,6 @@ mod tests {
             headers,
             body: "eyJ0ZXN0IjoidmFsdWUifQ==".to_string(),
             processing_time_ms: 123,
-            total_chunks: None,
         };
 
         assert_eq!(res.headers.len(), 2);
@@ -128,7 +121,6 @@ mod tests {
             headers,
             body: "dGVzdCBkYXRh".to_string(), // "test data"
             processing_time_ms: 456,
-            total_chunks: None,
         };
 
         let json = serde_json::to_string(&res).unwrap();
@@ -157,7 +149,6 @@ mod tests {
             headers,
             body: String::new(),
             processing_time_ms: 0,
-            total_chunks: None,
         };
 
         assert_eq!(res.headers.get("set-cookie").unwrap().len(), 2);

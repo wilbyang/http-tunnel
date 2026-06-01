@@ -1,4 +1,4 @@
-encryptionsalt: v1:+WodhkHyEfk=:v1:9Zg5dBS1zCN/XzWK:3w+hLlPt7TxxkCfk6D/1RQSEPA+1pA==
+encryptionsalt: v1:KCOS2nLtS8I=:v1:o6mYimlz0Bz/RAmN:EU6yBAQyM/EQwc9NDUupMArKKSxbFA==
 config:
   aws:region: eu-west-1
   aws:profile: mine
