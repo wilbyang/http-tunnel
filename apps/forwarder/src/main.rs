@@ -17,10 +17,10 @@ use std::{
 };
 use tokio::sync::{Mutex, mpsc};
 use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async,
+    MaybeTlsStream, WebSocketStream, connect_async_with_config,
     tungstenite::{
         Message as WsMessage, client::IntoClientRequest, handshake::client::Request,
-        http::HeaderValue,
+        http::HeaderValue, protocol::WebSocketConfig,
     },
 };
 use tracing::{debug, error, info, warn};
@@ -184,6 +184,14 @@ fn build_websocket_request(
     Ok(request)
 }
 
+/// Build WebSocket configuration with custom frame size limit
+/// The default 32KB limit is too small for larger HTTP responses
+/// We set it to 3MB to match the request body size limit with overhead
+fn build_websocket_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_frame_size(Some(3 * 1024 * 1024)) // 3MB frame size
+}
+
 /// Connection state tracking
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -291,7 +299,7 @@ impl ConnectionManager {
             debug!("Connecting without authentication");
         }
 
-        let (mut ws_stream, _) = connect_async(request)
+        let (mut ws_stream, _) = connect_async_with_config(request, Some(build_websocket_config()), false)
             .await
             .map_err(|e| TunnelError::ConnectionError(e.to_string()))?;
 
