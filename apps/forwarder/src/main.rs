@@ -474,8 +474,15 @@ async fn handle_text_message(
     local_address: &str,
     request_timeout: Duration,
 ) -> Result<()> {
-    let message: Message = serde_json::from_str(text)
-        .map_err(|e| TunnelError::InvalidMessage(format!("Failed to parse message: {}", e)))?;
+    let message: Message = match serde_json::from_str(text) {
+        Ok(m) => m,
+        Err(e) => {
+            // API Gateway may send non-tunnel JSON (e.g. error envelopes).
+            // Log and skip rather than crashing the read loop.
+            warn!("Ignoring non-tunnel message ({}): {}", e, &text[..text.len().min(200)]);
+            return Ok(());
+        }
+    };
 
     match message {
         Message::ConnectionEstablished {
@@ -610,6 +617,7 @@ async fn handle_http_request(
                 headers,
                 body,
                 processing_time_ms: processing_time,
+                total_chunks: None,
             };
 
             // Use chunking for large responses to work around 32KB API Gateway limit

@@ -1,94 +1,59 @@
 /// Response chunking utilities for handling large responses over 32KB API Gateway limit
 ///
 /// AWS API Gateway has a 32KB per-message limit for WebSocket messages. To support
-/// larger HTTP responses, we split them into chunks and reassemble on the receiving end.
+/// larger HTTP responses, we split the body into chunks and send them separately.
+///
+/// Protocol:
+/// 1. Send `HttpResponse` with empty body and `total_chunks = Some(n)` (metadata only)
+/// 2. Send n `ResponseChunk` messages carrying the body in 30KB segments
+/// 3. Handler reassembles all chunks into the final response
 
 use crate::protocol::Message;
 use crate::HttpResponse;
 
-/// Maximum safe chunk size that leaves room for JSON overhead
+/// Maximum safe chunk size leaving room for JSON overhead
 /// 32KB API Gateway limit - JSON overhead (~500 bytes for metadata)
 const CHUNK_SIZE_BYTES: usize = 30 * 1024; // 30KB per chunk
 
-/// Check if a response needs chunking
+/// Check if a response needs chunking based on body size
 pub fn should_chunk_response(response: &HttpResponse) -> bool {
-    // Estimate JSON size: response metadata + base64 body
-    // Base64 is ~33% larger than binary, plus JSON overhead
-    let estimated_json_size = estimate_response_json_size(response);
-    estimated_json_size > 28 * 1024 // Leave 4KB buffer from 32KB limit
+    // Estimate total JSON size: metadata (~300 bytes) + base64 body
+    300 + response.body.len() > 28 * 1024
 }
 
-/// Estimate the JSON serialized size of an HttpResponse
-fn estimate_response_json_size(response: &HttpResponse) -> usize {
-    // Rough estimate: response metadata (~200 bytes) + body size
-    200 + response.body.len()
-}
-
-/// Split a response into chunks
+/// Split a large response into a header message plus body chunk messages.
 ///
-/// Returns a vector of Message::ResponseChunk messages that should be sent in order.
-/// The receiving end will reassemble them by matching request_id and collecting chunks in order.
+/// Returns:
+/// - `[HttpResponse(metadata, empty body, total_chunks=n), ResponseChunk(0), ..., ResponseChunk(n-1)]`
+/// - Or `[HttpResponse(full response)]` if small enough to fit in one message.
 pub fn chunk_response(response: HttpResponse) -> Vec<Message> {
-    let request_id = response.request_id.clone();
-    let body = response.body.clone();
-
-    // If body is small enough, send as regular response
-    if body.len() <= CHUNK_SIZE_BYTES {
+    if !should_chunk_response(&response) {
         return vec![Message::HttpResponse(response)];
     }
 
-    // Split body into chunks
-    let mut chunks = Vec::new();
-    let total_chunks = (body.len() + CHUNK_SIZE_BYTES - 1) / CHUNK_SIZE_BYTES;
+    let body = response.body.clone();
+    let total_chunks = ((body.len() + CHUNK_SIZE_BYTES - 1) / CHUNK_SIZE_BYTES) as u32;
 
-    for (chunk_index, chunk) in body
-        .as_bytes()
-        .chunks(CHUNK_SIZE_BYTES)
-        .enumerate()
-    {
-        let chunk_data = String::from_utf8_lossy(chunk).to_string();
-        chunks.push(Message::ResponseChunk {
-            request_id: request_id.clone(),
+    // First: send metadata with empty body and total_chunks flag
+    let mut messages = vec![Message::HttpResponse(HttpResponse {
+        body: String::new(),
+        total_chunks: Some(total_chunks),
+        ..response.clone()
+    })];
+
+    // Then: send body parts as sequential chunks
+    for (chunk_index, chunk_bytes) in body.as_bytes().chunks(CHUNK_SIZE_BYTES).enumerate() {
+        // Safety: base64 only contains ASCII, so byte slice is valid UTF-8
+        let chunk_data = String::from_utf8_lossy(chunk_bytes).into_owned();
+        messages.push(Message::ResponseChunk {
+            request_id: response.request_id.clone(),
             chunk_index: chunk_index as u32,
-            total_chunks: total_chunks as u32,
+            total_chunks,
             chunk_data,
         });
     }
 
-    chunks
-}
-
-/// Reassemble chunks back into a response
-///
-/// Collects chunks indexed by chunk_index. Returns Some(HttpResponse) when all chunks
-/// are received, or None if any are missing or out of order.
-pub fn reassemble_chunks(
-    response_template: HttpResponse,
-    chunks: &[(u32, String)], // (chunk_index, chunk_data)
-) -> Option<HttpResponse> {
-    if chunks.is_empty() {
-        return Some(response_template);
-    }
-
-    // Verify we have all chunks
-    let total_chunks = chunks.iter().map(|(i, _)| i + 1).max().unwrap_or(0);
-    if chunks.len() as u32 != total_chunks {
-        return None;
-    }
-
-    // Verify sequential indices
-    for (i, (idx, _)) in chunks.iter().enumerate() {
-        if *idx != i as u32 {
-            return None;
-        }
-    }
-
-    // Reassemble body
-    let body = chunks.iter().map(|(_, data)| data.as_str()).collect::<String>();
-
-    let mut reassembled = response_template;
-    reassembled.body = body;
-    Some(reassembled)
+    messages
 }
 
 #[cfg(test)]
@@ -96,94 +61,77 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn make_test_response(body_size: usize) -> HttpResponse {
+    fn make_response(body_size: usize) -> HttpResponse {
         HttpResponse {
-            request_id: "test-123".to_string(),
+            request_id: "req-123".to_string(),
             status_code: 200,
             headers: HashMap::from([(
                 "content-type".to_string(),
                 vec!["text/plain".to_string()],
             )]),
             body: "x".repeat(body_size),
-            processing_time_ms: 0,
+            processing_time_ms: 10,
+            total_chunks: None,
         }
     }
 
     #[test]
     fn test_small_response_not_chunked() {
-        let response = make_test_response(1000);
-        assert!(!should_chunk_response(&response));
+        let r = make_response(1000);
+        assert!(!should_chunk_response(&r));
+        let msgs = chunk_response(r.clone());
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(msgs[0], Message::HttpResponse(_)));
     }
 
     #[test]
     fn test_large_response_chunked() {
-        let response = make_test_response(100 * 1024); // 100KB
-        assert!(should_chunk_response(&response));
-    }
+        let r = make_response(100 * 1024); // 100KB
+        assert!(should_chunk_response(&r));
 
-    #[test]
-    fn test_chunk_small_response() {
-        let response = make_test_response(1000);
-        let chunks = chunk_response(response.clone());
-        assert_eq!(chunks.len(), 1);
-        match &chunks[0] {
+        let msgs = chunk_response(r.clone());
+        assert!(msgs.len() > 2); // header + multiple chunks
+
+        // First message is HttpResponse with empty body and total_chunks set
+        match &msgs[0] {
             Message::HttpResponse(resp) => {
-                assert_eq!(resp.body, response.body);
+                assert!(resp.body.is_empty());
+                assert!(resp.total_chunks.is_some());
+                assert_eq!(resp.status_code, 200);
             }
-            _ => panic!("Expected HttpResponse"),
+            _ => panic!("First message should be HttpResponse"),
         }
+
+        // Remaining messages are ResponseChunk
+        let total_chunks = match &msgs[0] {
+            Message::HttpResponse(r) => r.total_chunks.unwrap(),
+            _ => panic!(),
+        };
+        assert_eq!(msgs.len() as u32, 1 + total_chunks);
+
+        // Verify chunks can be reassembled into original body
+        let reassembled_body: String = msgs[1..]
+            .iter()
+            .map(|m| match m {
+                Message::ResponseChunk { chunk_data, .. } => chunk_data.as_str(),
+                _ => panic!("Expected ResponseChunk"),
+            })
+            .collect();
+        assert_eq!(reassembled_body, r.body);
     }
 
     #[test]
-    fn test_chunk_large_response() {
-        let response = make_test_response(100 * 1024); // 100KB
-        let chunks = chunk_response(response.clone());
+    fn test_chunk_indices_are_sequential() {
+        let r = make_response(100 * 1024);
+        let msgs = chunk_response(r);
 
-        // Should be split into multiple chunks
-        assert!(chunks.len() > 1);
-
-        // All should be ResponseChunk messages
-        for chunk in &chunks {
-            match chunk {
-                Message::ResponseChunk {
-                    request_id,
-                    chunk_index,
-                    total_chunks,
-                    chunk_data,
-                } => {
-                    assert_eq!(request_id, &response.request_id);
-                    assert!(*chunk_index < *total_chunks);
-                    assert!(!chunk_data.is_empty());
+        for (expected_idx, msg) in msgs[1..].iter().enumerate() {
+            match msg {
+                Message::ResponseChunk { chunk_index, .. } => {
+                    assert_eq!(*chunk_index, expected_idx as u32);
                 }
                 _ => panic!("Expected ResponseChunk"),
             }
         }
-    }
-
-    #[test]
-    fn test_reassemble_chunks() {
-        let original = make_test_response(100 * 1024);
-        let chunks = chunk_response(original.clone());
-
-        // Extract chunk data
-        let mut chunk_data = Vec::new();
-        for chunk in &chunks {
-            match chunk {
-                Message::ResponseChunk {
-                    chunk_index,
-                    chunk_data: data,
-                    ..
-                } => {
-                    chunk_data.push((*chunk_index, data.clone()));
-                }
-                _ => panic!("Expected ResponseChunk"),
-            }
-        }
-
-        // Reassemble
-        let template = make_test_response(0);
-        let reassembled = reassemble_chunks(template, &chunk_data).unwrap();
-
-        assert_eq!(reassembled.body, original.body);
     }
 }

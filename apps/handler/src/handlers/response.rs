@@ -124,33 +124,53 @@ pub async fn handle_response(
     Ok(response)
 }
 
-/// Handle HTTP response from agent
+/// Handle HTTP response from agent.
+///
+/// If `total_chunks` is set, the body is empty and body data will arrive in
+/// separate `ResponseChunk` messages. Store the metadata as "chunked_pending".
+/// Otherwise store as a normal completed response.
 async fn handle_http_response(
     client: &DynamoDbClient,
     response: HttpResponse,
 ) -> Result<(), Error> {
-    update_pending_request_with_response(client, &response)
-        .await
-        .map_err(|e| {
-            error!(
-                "Failed to update pending request {}: {}",
-                response.request_id, e
-            );
-            format!("Failed to update pending request: {}", e)
-        })?;
-
-    debug!(
-        "Successfully updated pending request: {}",
-        response.request_id
-    );
+    if let Some(total_chunks) = response.total_chunks {
+        // Store metadata only (body arrives in chunks)
+        crate::store_chunked_response_metadata(client, &response, total_chunks)
+            .await
+            .map_err(|e| {
+                error!(
+                    "Failed to store chunked response metadata for {}: {}",
+                    response.request_id, e
+                );
+                format!("Failed to store chunked response metadata: {}", e)
+            })?;
+        debug!(
+            "Stored chunked metadata for {}, expecting {} chunks",
+            response.request_id, total_chunks
+        );
+    } else {
+        update_pending_request_with_response(client, &response)
+            .await
+            .map_err(|e| {
+                error!(
+                    "Failed to update pending request {}: {}",
+                    response.request_id, e
+                );
+                format!("Failed to update pending request: {}", e)
+            })?;
+        debug!(
+            "Successfully updated pending request: {}",
+            response.request_id
+        );
+    }
 
     Ok(())
 }
 
-/// Handle response chunk from agent
+/// Handle response chunk from agent.
 ///
-/// Stores the chunk temporarily. When all chunks for a request are received,
-/// reassembles them into the full response.
+/// Stores the chunk on the existing DynamoDB item. When all chunks are stored,
+/// reassembles the full response and marks the request as completed.
 async fn handle_response_chunk(
     client: &DynamoDbClient,
     request_id: &str,
@@ -158,45 +178,38 @@ async fn handle_response_chunk(
     total_chunks: u32,
     chunk_data: String,
 ) -> Result<(), Error> {
-    use crate::{store_response_chunk, get_and_reassemble_chunks};
+    use crate::{get_and_reassemble_chunks, store_response_chunk};
 
-    // Store this chunk
-    store_response_chunk(client, request_id, chunk_index, total_chunks, chunk_data)
+    // Store this chunk as an attribute on the request item
+    store_response_chunk(client, request_id, chunk_index, chunk_data)
         .await
         .map_err(|e| {
             error!("Failed to store response chunk: {}", e);
             format!("Failed to store response chunk: {}", e)
         })?;
 
-    // Try to reassemble if this is the last chunk
+    // When the last chunk arrives, reassemble and complete the request
     if chunk_index == total_chunks - 1 {
         debug!(
-            "Last chunk received for {}, attempting reassembly",
+            "Last chunk ({}/{}) received for {}, reassembling",
+            chunk_index + 1,
+            total_chunks,
             request_id
         );
 
-        match get_and_reassemble_chunks(client, request_id, total_chunks)
-            .await
-            .map_err(|e| format!("Failed to reassemble chunks: {}", e))
-        {
-            Ok(Some(response)) => {
+        match get_and_reassemble_chunks(client, request_id, total_chunks).await {
+            Ok(Some(_)) => {
                 debug!("Successfully reassembled response for {}", request_id);
-                update_pending_request_with_response(client, &response)
-                    .await
-                    .map_err(|e| {
-                        error!(
-                            "Failed to update pending request {}: {}",
-                            request_id, e
-                        );
-                        format!("Failed to update pending request: {}", e)
-                    })?;
             }
             Ok(None) => {
-                warn!("Some chunks missing for {}, will retry on next chunk", request_id);
+                warn!(
+                    "Could not reassemble chunks for {} — some may be missing",
+                    request_id
+                );
             }
             Err(e) => {
                 error!("Failed to reassemble chunks for {}: {}", request_id, e);
-                return Err(e.into());
+                return Err(format!("Failed to reassemble chunks: {}", e).into());
             }
         }
     }
@@ -341,6 +354,7 @@ async fn handle_error_response(
             .collect(),
         body: encode_body(message.as_bytes()),
         processing_time_ms: 0,
+        total_chunks: None,
     };
 
     let response_data = serde_json::to_string(&error_response).map_err(|e| {
@@ -405,6 +419,7 @@ mod tests {
                 .collect(),
             body: encode_body(b"Service error"),
             processing_time_ms: 0,
+            total_chunks: None,
         };
 
         assert_eq!(error_response.status_code, 502);

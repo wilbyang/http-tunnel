@@ -578,41 +578,80 @@ pub async fn update_pending_request_with_response(
     Ok(())
 }
 
-/// Store a response chunk temporarily while waiting for all chunks
+/// Store chunked response metadata (header message) as "chunked_pending".
+///
+/// Called when `HttpResponse` with `total_chunks > 0` arrives. The body is empty;
+/// body data will arrive in separate `ResponseChunk` messages.
+pub async fn store_chunked_response_metadata(
+    client: &DynamoDbClient,
+    response: &HttpResponse,
+    total_chunks: u32,
+) -> Result<()> {
+    let table_name = env::get_pending_requests_table_name()?;
+
+    // Serialize the metadata (with empty body) for later use during reassembly
+    let response_data =
+        serde_json::to_string(response).context("Failed to serialize response metadata")?;
+
+    client
+        .update_item()
+        .table_name(&table_name)
+        .key("requestId", AttributeValue::S(response.request_id.clone()))
+        .update_expression(
+            "SET #status = :status, responseData = :data, totalChunks = :total",
+        )
+        .expression_attribute_names("#status", "status")
+        .expression_attribute_values(":status", AttributeValue::S("chunked_pending".to_string()))
+        .expression_attribute_values(":data", AttributeValue::S(response_data))
+        .expression_attribute_values(
+            ":total",
+            AttributeValue::N(total_chunks.to_string()),
+        )
+        .send()
+        .await
+        .context("Failed to store chunked response metadata")?;
+
+    debug!(
+        "Stored chunked metadata for {}, expecting {} chunks",
+        response.request_id, total_chunks
+    );
+
+    Ok(())
+}
+
+/// Store a response chunk as an attribute on the existing pending request item.
+///
+/// Each chunk is stored as attribute `chunk_<N>` on the item keyed by `requestId`.
+/// The table has no sort key, so all updates are to the single item for this request.
 pub async fn store_response_chunk(
     client: &DynamoDbClient,
     request_id: &str,
     chunk_index: u32,
-    total_chunks: u32,
     chunk_data: String,
 ) -> Result<()> {
     let table_name = env::get_pending_requests_table_name()?;
-
-    // Use a separate sort key to store chunk data
-    let chunk_key = format!("chunk#{}#{}", chunk_index, total_chunks);
+    let attr_name = format!("chunk_{}", chunk_index);
+    let expr_attr_name = format!("#chunk_{}", chunk_index);
 
     client
         .update_item()
         .table_name(&table_name)
         .key("requestId", AttributeValue::S(request_id.to_string()))
-        .key("sortKey", AttributeValue::S(chunk_key))
-        .update_expression("SET chunkData = :data, #ttl = :ttl")
-        .expression_attribute_names("#ttl", "ttl")
+        .update_expression(format!("SET {} = :data", expr_attr_name))
+        .expression_attribute_names(expr_attr_name, attr_name)
         .expression_attribute_values(":data", AttributeValue::S(chunk_data))
-        .expression_attribute_values(
-            ":ttl",
-            AttributeValue::N(calculate_ttl(PENDING_REQUEST_TTL_SECS).to_string()),
-        )
         .send()
         .await
         .context("Failed to store response chunk")?;
 
-    debug!("Stored chunk {}/{} for request {}", chunk_index, total_chunks, request_id);
+    debug!("Stored chunk {} for request {}", chunk_index, request_id);
 
     Ok(())
 }
 
-/// Retrieve and reassemble response chunks when all have been received
+/// Retrieve the item, reassemble body from chunk_0..chunk_N attributes, and mark completed.
+///
+/// Returns the completed HttpResponse with reassembled body, or None if any chunk is missing.
 pub async fn get_and_reassemble_chunks(
     client: &DynamoDbClient,
     request_id: &str,
@@ -620,51 +659,47 @@ pub async fn get_and_reassemble_chunks(
 ) -> Result<Option<HttpResponse>> {
     let table_name = env::get_pending_requests_table_name()?;
 
-    // Query for all chunks
-    let mut chunks = Vec::new();
-    for i in 0..total_chunks {
-        let chunk_key = format!("chunk#{}#{}", i, total_chunks);
-        let result = client
-            .get_item()
-            .table_name(&table_name)
-            .key("requestId", AttributeValue::S(request_id.to_string()))
-            .key("sortKey", AttributeValue::S(chunk_key))
-            .send()
-            .await
-            .context("Failed to query response chunk")?;
-
-        if let Some(item) = result.item {
-            if let Some(data) = item.get("chunkData").and_then(|v| v.as_s().ok()) {
-                chunks.push((i, data.clone()));
-            } else {
-                return Ok(None); // Missing chunk
-            }
-        } else {
-            return Ok(None); // Chunk not found
-        }
-    }
-
-    // Get the base response from main request record
     let result = client
         .get_item()
         .table_name(&table_name)
         .key("requestId", AttributeValue::S(request_id.to_string()))
         .send()
         .await
-        .context("Failed to get pending request")?;
+        .context("Failed to get pending request item")?;
 
-    if let Some(item) = result.item {
-        if let Some(response_data) = item.get("responseData").and_then(|v| v.as_s().ok()) {
-            let template: HttpResponse = serde_json::from_str(response_data)
-                .context("Failed to parse response template")?;
+    let item = match result.item {
+        Some(item) => item,
+        None => return Ok(None),
+    };
 
-            // Reassemble chunks
-            let reassembled = http_tunnel_common::chunking::reassemble_chunks(template, &chunks);
-            return Ok(reassembled);
+    // Read metadata stored when the HttpResponse header arrived
+    let response_data = match item.get("responseData").and_then(|v| v.as_s().ok()) {
+        Some(d) => d,
+        None => return Ok(None),
+    };
+    let mut response: HttpResponse =
+        serde_json::from_str(response_data).context("Failed to parse response metadata")?;
+
+    // Collect and concatenate all chunk_N attributes in order
+    let mut body = String::new();
+    for i in 0..total_chunks {
+        let attr_name = format!("chunk_{}", i);
+        match item.get(&attr_name).and_then(|v| v.as_s().ok()) {
+            Some(data) => body.push_str(data),
+            None => {
+                debug!("Chunk {} not yet available for request {}", i, request_id);
+                return Ok(None);
+            }
         }
     }
 
-    Ok(None)
+    response.body = body;
+    response.total_chunks = None; // Clear the flag; body is now complete
+
+    // Update item to completed with assembled response
+    update_pending_request_with_response(client, &response).await?;
+
+    Ok(Some(response))
 }
 
 #[cfg(test)]
@@ -767,6 +802,7 @@ mod tests {
             headers,
             body: "eyJ0ZXN0IjoidmFsdWUifQ==".to_string(),
             processing_time_ms: 123,
+            total_chunks: None,
         };
 
         let apigw_response = build_api_gateway_response(http_api::ApiGatewayVersion::V1, response);
@@ -798,6 +834,7 @@ mod tests {
             headers,
             body: "eyJ0ZXN0IjoidmFsdWUifQ==".to_string(),
             processing_time_ms: 123,
+            total_chunks: None,
         };
 
         let apigw_response = build_api_gateway_response(http_api::ApiGatewayVersion::V2, response);
@@ -823,6 +860,7 @@ mod tests {
             headers: HashMap::new(),
             body: String::new(),
             processing_time_ms: 0,
+            total_chunks: None,
         };
 
         // Test both versions
