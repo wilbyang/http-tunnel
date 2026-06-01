@@ -71,6 +71,25 @@ pub async fn handle_response(
             );
             handle_http_response(&clients.dynamodb, response).await?;
         }
+        Message::ResponseChunk {
+            request_id,
+            chunk_index,
+            total_chunks,
+            chunk_data,
+        } => {
+            debug!(
+                "Received response chunk {}/{} for request {}",
+                chunk_index, total_chunks, request_id
+            );
+            handle_response_chunk(
+                &clients.dynamodb,
+                &request_id,
+                chunk_index,
+                total_chunks,
+                chunk_data,
+            )
+            .await?;
+        }
         Message::Ping => {
             // Heartbeat received, no action needed
             debug!("Received ping from agent");
@@ -124,6 +143,63 @@ async fn handle_http_response(
         "Successfully updated pending request: {}",
         response.request_id
     );
+
+    Ok(())
+}
+
+/// Handle response chunk from agent
+///
+/// Stores the chunk temporarily. When all chunks for a request are received,
+/// reassembles them into the full response.
+async fn handle_response_chunk(
+    client: &DynamoDbClient,
+    request_id: &str,
+    chunk_index: u32,
+    total_chunks: u32,
+    chunk_data: String,
+) -> Result<(), Error> {
+    use crate::{store_response_chunk, get_and_reassemble_chunks};
+
+    // Store this chunk
+    store_response_chunk(client, request_id, chunk_index, total_chunks, chunk_data)
+        .await
+        .map_err(|e| {
+            error!("Failed to store response chunk: {}", e);
+            format!("Failed to store response chunk: {}", e)
+        })?;
+
+    // Try to reassemble if this is the last chunk
+    if chunk_index == total_chunks - 1 {
+        debug!(
+            "Last chunk received for {}, attempting reassembly",
+            request_id
+        );
+
+        match get_and_reassemble_chunks(client, request_id, total_chunks)
+            .await
+            .map_err(|e| format!("Failed to reassemble chunks: {}", e))
+        {
+            Ok(Some(response)) => {
+                debug!("Successfully reassembled response for {}", request_id);
+                update_pending_request_with_response(client, &response)
+                    .await
+                    .map_err(|e| {
+                        error!(
+                            "Failed to update pending request {}: {}",
+                            request_id, e
+                        );
+                        format!("Failed to update pending request: {}", e)
+                    })?;
+            }
+            Ok(None) => {
+                warn!("Some chunks missing for {}, will retry on next chunk", request_id);
+            }
+            Err(e) => {
+                error!("Failed to reassemble chunks for {}: {}", request_id, e);
+                return Err(e.into());
+            }
+        }
+    }
 
     Ok(())
 }

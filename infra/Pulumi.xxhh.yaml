@@ -1,4 +1,4 @@
-encryptionsalt: v1:+WodhkHyEfk=:v1:9Zg5dBS1zCN/XzWK:3w+hLlPt7TxxkCfk6D/1RQSEPA+1pA==
+encryptionsalt: v1:0s8jUI9PYQs=:v1:uXgNpDyDyH/ULp6M:YZJasAkTIAZjeMGEn+NbYtgCxjvr4A==
 config:
   aws:region: eu-west-1
   aws:profile: mine
@@ -12,3 +12,4 @@ config:
   http-tunnel:hostedZoneId: Z00822932GKA9H8VPA8QB
   http-tunnel:enableSubdomainRouting: "true"
   http-tunnel:certificateArn: arn:aws:acm:eu-west-1:647420212900:certificate/217c4288-9732-47fe-a5d9-ca2317ba1be1
+

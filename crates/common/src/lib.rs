@@ -3,6 +3,7 @@
 //! This crate provides shared data structures, protocols, and utilities used by both
 //! the forwarder (client agent) and handler (Lambda functions).
 
+pub mod chunking;
 pub mod constants;
 pub mod error;
 pub mod models;

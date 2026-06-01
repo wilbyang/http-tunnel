@@ -578,6 +578,95 @@ pub async fn update_pending_request_with_response(
     Ok(())
 }
 
+/// Store a response chunk temporarily while waiting for all chunks
+pub async fn store_response_chunk(
+    client: &DynamoDbClient,
+    request_id: &str,
+    chunk_index: u32,
+    total_chunks: u32,
+    chunk_data: String,
+) -> Result<()> {
+    let table_name = env::get_pending_requests_table_name()?;
+
+    // Use a separate sort key to store chunk data
+    let chunk_key = format!("chunk#{}#{}", chunk_index, total_chunks);
+
+    client
+        .update_item()
+        .table_name(&table_name)
+        .key("requestId", AttributeValue::S(request_id.to_string()))
+        .key("sortKey", AttributeValue::S(chunk_key))
+        .update_expression("SET chunkData = :data, #ttl = :ttl")
+        .expression_attribute_names("#ttl", "ttl")
+        .expression_attribute_values(":data", AttributeValue::S(chunk_data))
+        .expression_attribute_values(
+            ":ttl",
+            AttributeValue::N(calculate_ttl(PENDING_REQUEST_TTL_SECS).to_string()),
+        )
+        .send()
+        .await
+        .context("Failed to store response chunk")?;
+
+    debug!("Stored chunk {}/{} for request {}", chunk_index, total_chunks, request_id);
+
+    Ok(())
+}
+
+/// Retrieve and reassemble response chunks when all have been received
+pub async fn get_and_reassemble_chunks(
+    client: &DynamoDbClient,
+    request_id: &str,
+    total_chunks: u32,
+) -> Result<Option<HttpResponse>> {
+    let table_name = env::get_pending_requests_table_name()?;
+
+    // Query for all chunks
+    let mut chunks = Vec::new();
+    for i in 0..total_chunks {
+        let chunk_key = format!("chunk#{}#{}", i, total_chunks);
+        let result = client
+            .get_item()
+            .table_name(&table_name)
+            .key("requestId", AttributeValue::S(request_id.to_string()))
+            .key("sortKey", AttributeValue::S(chunk_key))
+            .send()
+            .await
+            .context("Failed to query response chunk")?;
+
+        if let Some(item) = result.item {
+            if let Some(data) = item.get("chunkData").and_then(|v| v.as_s().ok()) {
+                chunks.push((i, data.clone()));
+            } else {
+                return Ok(None); // Missing chunk
+            }
+        } else {
+            return Ok(None); // Chunk not found
+        }
+    }
+
+    // Get the base response from main request record
+    let result = client
+        .get_item()
+        .table_name(&table_name)
+        .key("requestId", AttributeValue::S(request_id.to_string()))
+        .send()
+        .await
+        .context("Failed to get pending request")?;
+
+    if let Some(item) = result.item {
+        if let Some(response_data) = item.get("responseData").and_then(|v| v.as_s().ok()) {
+            let template: HttpResponse = serde_json::from_str(response_data)
+                .context("Failed to parse response template")?;
+
+            // Reassemble chunks
+            let reassembled = http_tunnel_common::chunking::reassemble_chunks(template, &chunks);
+            return Ok(reassembled);
+        }
+    }
+
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
