@@ -14,6 +14,7 @@ use aws_sdk_apigatewaymanagement::primitives::Blob;
 use aws_sdk_dynamodb::Client as DynamoDbClient;
 use aws_sdk_dynamodb::types::AttributeValue;
 use aws_sdk_eventbridge::Client as EventBridgeClient;
+use aws_sdk_s3::Client as S3Client;
 use http_tunnel_common::ConnectionMetadata;
 use http_tunnel_common::constants::{
     OPTIMIZED_POLL_FINAL_INTERVAL_MS, OPTIMIZED_POLL_FIRST_INTERVAL_MS,
@@ -31,6 +32,7 @@ pub mod env;
 pub mod error_handling;
 pub mod handlers;
 pub mod http_api;
+pub mod object_store;
 
 /// Check if event-driven response pattern is enabled
 pub fn is_event_driven_enabled() -> bool {
@@ -45,6 +47,7 @@ pub struct SharedClients {
     pub dynamodb: DynamoDbClient,
     pub apigw_management: Option<ApiGatewayManagementClient>,
     pub eventbridge: EventBridgeClient,
+    pub s3: S3Client,
 }
 
 /// Extract tunnel ID from request path (path-based routing)
@@ -220,10 +223,15 @@ pub async fn delete_connection(client: &DynamoDbClient, connection_id: &str) -> 
 }
 
 /// Look up connection ID by tunnel ID using GSI (path-based routing)
+pub struct ConnectionTarget {
+    pub connection_id: String,
+    pub external_body_v1: bool,
+}
+
 pub async fn lookup_connection_by_tunnel_id(
     client: &DynamoDbClient,
     tunnel_id: &str,
-) -> Result<String> {
+) -> Result<ConnectionTarget> {
     let table_name = env::get_connections_table_name()?;
     let index_name = env::get_tunnel_id_index_name();
 
@@ -258,7 +266,16 @@ pub async fn lookup_connection_by_tunnel_id(
         .and_then(|v| v.as_s().ok())
         .ok_or_else(|| anyhow!("Missing connectionId in DynamoDB item"))?;
 
-    Ok(connection_id.clone())
+    let external_body_v1 = item
+        .get("externalBodyV1")
+        .and_then(|v| v.as_bool().ok())
+        .copied()
+        .unwrap_or(false);
+
+    Ok(ConnectionTarget {
+        connection_id: connection_id.clone(),
+        external_body_v1,
+    })
 }
 
 /// Build HttpRequest from unified API Gateway request (supports both v1 and v2)
@@ -289,6 +306,7 @@ pub fn build_http_request(request: &http_api::HttpApiRequest, request_id: String
                 http_tunnel_common::encode_body(b.as_bytes())
             }
         })
+        .map(http_tunnel_common::BodyRef::legacy)
         .unwrap_or_default();
 
     HttpRequest {
@@ -297,6 +315,7 @@ pub fn build_http_request(request: &http_api::HttpApiRequest, request_id: String
         uri,
         headers,
         body,
+        response_upload: None,
         timestamp: current_timestamp_millis(),
     }
 }
@@ -528,17 +547,17 @@ pub fn build_api_gateway_response(
             v.first().and_then(|val| {
                 HeaderName::from_bytes(k.as_bytes())
                     .ok()
-                    .and_then(|name| HeaderValue::from_str(val).ok().map(|value| (name, value)))
+                    .zip(HeaderValue::from_str(val).ok())
             })
         })
         .collect();
 
     // Build response using the unified builder
-    let body = if !response.body.is_empty() {
-        Some(response.body)
-    } else {
-        None
-    };
+    let body = response
+        .body
+        .inline_base64()
+        .filter(|body| !body.is_empty())
+        .map(str::to_owned);
 
     http_api::HttpApiResponse::from_builder(
         http_api::HttpApiResponseBuilder::new(version)
@@ -553,6 +572,7 @@ pub fn build_api_gateway_response(
 pub async fn update_pending_request_with_response(
     client: &DynamoDbClient,
     response: &HttpResponse,
+    connection_id: &str,
 ) -> Result<()> {
     let table_name = env::get_pending_requests_table_name()?;
 
@@ -566,9 +586,14 @@ pub async fn update_pending_request_with_response(
         .table_name(&table_name)
         .key("requestId", AttributeValue::S(response.request_id.clone()))
         .update_expression("SET #status = :status, responseData = :data")
+        .condition_expression("connectionId = :connection_id AND attribute_exists(requestId)")
         .expression_attribute_names("#status", "status")
         .expression_attribute_values(":status", AttributeValue::S("completed".to_string()))
         .expression_attribute_values(":data", AttributeValue::S(response_data))
+        .expression_attribute_values(
+            ":connection_id",
+            AttributeValue::S(connection_id.to_string()),
+        )
         .send()
         .await
         .context("Failed to update pending request with response")?;
@@ -676,7 +701,7 @@ mod tests {
             request_id: "req_123".to_string(),
             status_code: 200,
             headers,
-            body: "eyJ0ZXN0IjoidmFsdWUifQ==".to_string(),
+            body: http_tunnel_common::BodyRef::legacy("eyJ0ZXN0IjoidmFsdWUifQ==".to_string()),
             processing_time_ms: 123,
         };
 
@@ -707,7 +732,7 @@ mod tests {
             request_id: "req_123".to_string(),
             status_code: 200,
             headers,
-            body: "eyJ0ZXN0IjoidmFsdWUifQ==".to_string(),
+            body: http_tunnel_common::BodyRef::legacy("eyJ0ZXN0IjoidmFsdWUifQ==".to_string()),
             processing_time_ms: 123,
         };
 
@@ -732,7 +757,7 @@ mod tests {
             request_id: "req_123".to_string(),
             status_code: 204,
             headers: HashMap::new(),
-            body: String::new(),
+            body: http_tunnel_common::BodyRef::default(),
             processing_time_ms: 0,
         };
 

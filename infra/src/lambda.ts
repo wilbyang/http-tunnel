@@ -33,7 +33,8 @@ export function createLambdaHandler(
   pendingRequestsTableName: pulumi.Output<string>,
   httpApiId: pulumi.Output<string>,
   websocketApiEndpoint: pulumi.Output<string>,
-  eventBusName?: pulumi.Output<string>
+  eventBusName: pulumi.Output<string> | undefined,
+  transferBucketName: pulumi.Output<string>
 ): aws.lambda.Function {
   const architecture = appConfig.lambdaArchitecture === "arm64" ? "arm64" : "x86_64";
 
@@ -53,9 +54,10 @@ export function createLambdaHandler(
         httpApiId,
         websocketApiEndpoint,
         eventBusName,
+        transferBucketName,
         jwtSecret,
         jwksSecret
-      ]).apply(([connTable, reqTable, httpApiIdValue, wsEndpoint, busName, secret, jwks]) => {
+      ]).apply(([connTable, reqTable, httpApiIdValue, wsEndpoint, busName, bucketName, secret, jwks]) => {
         const vars: Record<string, string> = {
           RUST_LOG: "info",
           CONNECTIONS_TABLE_NAME: connTable,
@@ -65,6 +67,7 @@ export function createLambdaHandler(
           HTTP_API_ENDPOINT: `https://${httpApiIdValue}.execute-api.${appConfig.awsRegion}.amazonaws.com/${appConfig.environment}`,
           WEBSOCKET_API_ENDPOINT: wsEndpoint,
           EVENT_BUS_NAME: busName || `http-tunnel-events-${appConfig.environment}`,
+          TRANSFER_BUCKET_NAME: bucketName,
           USE_EVENT_DRIVEN: appConfig.useEventDriven ? "true" : "false",
           ENABLE_CUSTOM_DOMAIN: appConfig.enableCustomDomain ? "true" : "false",
           // Subdomain routing

@@ -32,6 +32,10 @@ pub fn get_pending_requests_table_name() -> Result<String> {
         .context("Neither DYNAMODB_TABLE1_NAME nor PENDING_REQUESTS_TABLE_NAME environment variable is set")
 }
 
+pub fn get_transfer_bucket_name() -> Result<String> {
+    std::env::var("TRANSFER_BUCKET_NAME").context("TRANSFER_BUCKET_NAME is not set")
+}
+
 /// Get the connections table name with a default fallback.
 ///
 /// For use in contexts where a default value is acceptable (e.g., cleanup handlers).

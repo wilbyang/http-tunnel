@@ -2,15 +2,16 @@ use anyhow::Result;
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt, stream::SplitSink, stream::SplitStream};
 use http_tunnel_common::{
-    ErrorCode, HttpRequest, HttpResponse, Message, TunnelError,
+    BodyLocation, BodyRef, ErrorCode, HttpRequest, HttpResponse, Message, ObjectStore, TunnelError,
     constants::{
-        HEARTBEAT_INTERVAL_SECS, RECONNECT_MAX_DELAY_MS, RECONNECT_MIN_DELAY_MS,
-        RECONNECT_MULTIPLIER,
+        HEARTBEAT_INTERVAL_SECS, MAX_BODY_SIZE_BYTES, MAX_WS_CONTROL_MESSAGE_BYTES,
+        RECONNECT_MAX_DELAY_MS, RECONNECT_MIN_DELAY_MS, RECONNECT_MULTIPLIER,
     },
     decode_body, encode_body, headers_to_map,
 };
 use reqwest::Client;
 use rustls::crypto::{CryptoProvider, ring};
+use sha2::{Digest, Sha256};
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -188,8 +189,7 @@ fn build_websocket_request(
 /// The default 32KB limit is too small for larger HTTP responses
 /// We set it to 3MB to match the request body size limit with overhead
 fn build_websocket_config() -> WebSocketConfig {
-    WebSocketConfig::default()
-        .max_frame_size(Some(3 * 1024 * 1024)) // 3MB frame size
+    WebSocketConfig::default().max_frame_size(Some(3 * 1024 * 1024)) // 3MB frame size
 }
 
 /// Connection state tracking
@@ -299,9 +299,10 @@ impl ConnectionManager {
             debug!("Connecting without authentication");
         }
 
-        let (mut ws_stream, _) = connect_async_with_config(request, Some(build_websocket_config()), false)
-            .await
-            .map_err(|e| TunnelError::ConnectionError(e.to_string()))?;
+        let (mut ws_stream, _) =
+            connect_async_with_config(request, Some(build_websocket_config()), false)
+                .await
+                .map_err(|e| TunnelError::ConnectionError(e.to_string()))?;
 
         info!("✅ WebSocket connection established, sending Ready message");
 
@@ -357,6 +358,16 @@ impl ConnectionManager {
         let public_url = timeout.await.map_err(|_| {
             TunnelError::ConnectionError("Connection handshake timeout".to_string())
         })??;
+
+        let capabilities = Message::Capabilities {
+            capabilities: vec!["external_body_s3_v1".to_string()],
+        };
+        ws_stream
+            .send(WsMessage::Text(
+                serde_json::to_string(&capabilities)?.into(),
+            ))
+            .await
+            .map_err(|e| TunnelError::WebSocketError(e.to_string()))?;
 
         Ok((ws_stream, public_url))
     }
@@ -582,10 +593,59 @@ async fn handle_http_request(
         }
     }
 
-    // Add body if present
+    // Resolve the request body. Large bodies use S3 while WebSocket carries only control data.
     if !request.body.is_empty() {
-        let body_bytes = decode_body(&request.body)
-            .map_err(|e| TunnelError::InvalidMessage(format!("Failed to decode body: {}", e)))?;
+        let body_bytes = match &request.body {
+            BodyRef::Legacy(base64) | BodyRef::Reference(BodyLocation::Inline { base64 }) => {
+                decode_body(base64).map_err(|e| {
+                    TunnelError::InvalidMessage(format!("Failed to decode body: {e}"))
+                })?
+            }
+            BodyRef::Reference(BodyLocation::External {
+                store: ObjectStore::S3,
+                total_bytes,
+                sha256,
+                download_url,
+                ..
+            }) => {
+                if *total_bytes > MAX_BODY_SIZE_BYTES as u64 {
+                    return Err(TunnelError::InvalidMessage(
+                        "External request body exceeds the configured size limit".to_string(),
+                    )
+                    .into());
+                }
+                let url = download_url.as_deref().ok_or_else(|| {
+                    TunnelError::InvalidMessage(
+                        "External request body has no download URL".to_string(),
+                    )
+                })?;
+                let response = client
+                    .get(url)
+                    .send()
+                    .await
+                    .map_err(|e| TunnelError::HttpError(format!("S3 download failed: {e}")))?;
+                if !response.status().is_success() {
+                    return Err(TunnelError::HttpError(format!(
+                        "S3 download failed with status {}",
+                        response.status()
+                    ))
+                    .into());
+                }
+                let bytes = response
+                    .bytes()
+                    .await
+                    .map_err(|e| TunnelError::HttpError(format!("S3 body read failed: {e}")))?;
+                if bytes.len() as u64 != *total_bytes
+                    || format!("{:x}", Sha256::digest(&bytes)) != *sha256
+                {
+                    return Err(TunnelError::InvalidMessage(
+                        "External request body failed integrity validation".to_string(),
+                    )
+                    .into());
+                }
+                bytes.to_vec()
+            }
+        };
         req_builder = req_builder.body(body_bytes);
     }
 
@@ -604,17 +664,61 @@ async fn handle_http_request(
 
             debug!("Response: {} ({}ms)", status_code, processing_time);
 
-            let http_response = HttpResponse {
+            let mut http_response = HttpResponse {
                 request_id,
                 status_code,
                 headers,
-                body,
+                body: BodyRef::legacy(body),
                 processing_time_ms: processing_time,
             };
 
-            let response_message = Message::HttpResponse(http_response);
-            let response_json = serde_json::to_string(&response_message)
+            let mut response_message = Message::HttpResponse(http_response.clone());
+            let mut response_json = serde_json::to_string(&response_message)
                 .map_err(|e| TunnelError::InvalidMessage(e.to_string()))?;
+
+            if response_json.len() > MAX_WS_CONTROL_MESSAGE_BYTES && !body_bytes.is_empty() {
+                if body_bytes.len() > MAX_BODY_SIZE_BYTES {
+                    return Err(TunnelError::HttpError(
+                        "Local response body exceeds the configured size limit".to_string(),
+                    )
+                    .into());
+                }
+                let grant = request.response_upload.as_ref().ok_or_else(|| {
+                    TunnelError::InvalidMessage(
+                        "Handler did not provide an external response upload grant".to_string(),
+                    )
+                })?;
+                let upload = client
+                    .put(&grant.upload_url)
+                    .body(body_bytes.clone())
+                    .send()
+                    .await
+                    .map_err(|e| TunnelError::HttpError(format!("S3 upload failed: {e}")))?;
+                if !upload.status().is_success() {
+                    return Err(TunnelError::HttpError(format!(
+                        "S3 upload failed with status {}",
+                        upload.status()
+                    ))
+                    .into());
+                }
+                http_response.body = BodyRef::external(
+                    grant.key.clone(),
+                    body_bytes.len() as u64,
+                    format!("{:x}", Sha256::digest(&body_bytes)),
+                    grant.expires_at,
+                    None,
+                );
+                response_message = Message::HttpResponse(http_response);
+                response_json = serde_json::to_string(&response_message)
+                    .map_err(|e| TunnelError::InvalidMessage(e.to_string()))?;
+            }
+
+            if response_json.len() > MAX_WS_CONTROL_MESSAGE_BYTES {
+                return Err(TunnelError::InvalidMessage(
+                    "Response metadata exceeds the WebSocket control message limit".to_string(),
+                )
+                .into());
+            }
 
             outgoing_tx
                 .send(WsMessage::Text(response_json.into()))

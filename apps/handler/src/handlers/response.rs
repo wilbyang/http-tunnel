@@ -48,8 +48,6 @@ pub async fn handle_response(
 ) -> Result<ApiGatewayProxyResponse, Error> {
     let body = event.payload.body.ok_or("Missing message body")?;
 
-    debug!("Received message from agent: {}", body);
-
     // Parse message
     let message: Message = serde_json::from_str(&body).map_err(|e| {
         error!("Failed to parse message: {}", e);
@@ -64,12 +62,18 @@ pub async fn handle_response(
             handle_ready_message(&clients.dynamodb, &clients.apigw_management, connection_id)
                 .await?;
         }
+        Message::Capabilities { capabilities } => {
+            let external_body_v1 = capabilities
+                .iter()
+                .any(|value| value == "external_body_s3_v1");
+            set_connection_capability(&clients.dynamodb, connection_id, external_body_v1).await?;
+        }
         Message::HttpResponse(response) => {
             info!(
                 "Received HTTP response for request {}: status {}",
                 response.request_id, response.status_code
             );
-            handle_http_response(&clients.dynamodb, response).await?;
+            handle_http_response(&clients.dynamodb, response, connection_id).await?;
         }
         Message::Ping => {
             // Heartbeat received, no action needed
@@ -89,7 +93,14 @@ pub async fn handle_response(
                     "Received error for request {}: {:?} - {}",
                     req_id, code, error_message
                 );
-                handle_error_response(&clients.dynamodb, &req_id, code, &error_message).await?;
+                handle_error_response(
+                    &clients.dynamodb,
+                    &req_id,
+                    connection_id,
+                    code,
+                    &error_message,
+                )
+                .await?;
             } else {
                 warn!("Received error without request ID: {}", error_message);
             }
@@ -109,8 +120,9 @@ pub async fn handle_response(
 async fn handle_http_response(
     client: &DynamoDbClient,
     response: HttpResponse,
+    connection_id: &str,
 ) -> Result<(), Error> {
-    update_pending_request_with_response(client, &response)
+    update_pending_request_with_response(client, &response, connection_id)
         .await
         .map_err(|e| {
             error!(
@@ -125,6 +137,24 @@ async fn handle_http_response(
         response.request_id
     );
 
+    Ok(())
+}
+
+async fn set_connection_capability(
+    client: &DynamoDbClient,
+    connection_id: &str,
+    external_body_v1: bool,
+) -> Result<(), Error> {
+    client
+        .update_item()
+        .table_name(env::get_connections_table_name().map_err(|e| e.to_string())?)
+        .key("connectionId", AttributeValue::S(connection_id.to_string()))
+        .update_expression("SET externalBodyV1 = :enabled")
+        .condition_expression("attribute_exists(connectionId)")
+        .expression_attribute_values(":enabled", AttributeValue::Bool(external_body_v1))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to record forwarder capabilities: {e}"))?;
     Ok(())
 }
 
@@ -244,6 +274,7 @@ async fn handle_ready_message(
 async fn handle_error_response(
     client: &DynamoDbClient,
     request_id: &str,
+    connection_id: &str,
     code: ErrorCode,
     message: &str,
 ) -> Result<(), Error> {
@@ -263,7 +294,7 @@ async fn handle_error_response(
         headers: [("Content-Type".to_string(), vec!["text/plain".to_string()])]
             .into_iter()
             .collect(),
-        body: encode_body(message.as_bytes()),
+        body: http_tunnel_common::BodyRef::legacy(encode_body(message.as_bytes())),
         processing_time_ms: 0,
     };
 
@@ -277,9 +308,14 @@ async fn handle_error_response(
         .table_name(&table_name)
         .key("requestId", AttributeValue::S(request_id.to_string()))
         .update_expression("SET #status = :status, responseData = :data")
+        .condition_expression("connectionId = :connection_id AND attribute_exists(requestId)")
         .expression_attribute_names("#status", "status")
         .expression_attribute_values(":status", AttributeValue::S("completed".to_string()))
         .expression_attribute_values(":data", AttributeValue::S(response_data))
+        .expression_attribute_values(
+            ":connection_id",
+            AttributeValue::S(connection_id.to_string()),
+        )
         .send()
         .await
         .map_err(|e| {
@@ -327,7 +363,7 @@ mod tests {
             headers: [("Content-Type".to_string(), vec!["text/plain".to_string()])]
                 .into_iter()
                 .collect(),
-            body: encode_body(b"Service error"),
+            body: http_tunnel_common::BodyRef::legacy(encode_body(b"Service error")),
             processing_time_ms: 0,
         };
 

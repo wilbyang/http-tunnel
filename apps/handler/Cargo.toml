@@ -35,7 +35,9 @@ aws-config = { version = "1.8", features = ["behavior-version-latest"] }
 aws-sdk-dynamodb = "1.101"
 aws-sdk-apigatewaymanagement = "1.91"
 aws-sdk-eventbridge = "1.98"
+aws-sdk-s3 = "1.115"
 rustls = { version = "0.23", features = ["ring"] }
+sha2.workspace = true
 
 # Logging
 tracing = "0.1"

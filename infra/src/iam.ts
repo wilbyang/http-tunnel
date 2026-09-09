@@ -14,7 +14,8 @@ const lambdaAssumeRolePolicy = aws.iam.assumeRolePolicyForPrincipal({
 export function createLambdaRole(
   connectionsTableArn: pulumi.Output<string>,
   pendingRequestsTableArn: pulumi.Output<string>,
-  eventBusArn?: pulumi.Output<string>
+  eventBusArn: pulumi.Output<string> | undefined,
+  transferBucketArn: pulumi.Output<string>
 ): aws.iam.Role {
   // Unified handler role with all permissions
   const handlerRole = new aws.iam.Role("handler-lambda-role", {
@@ -47,6 +48,7 @@ export function createLambdaRole(
             Action: [
               "dynamodb:PutItem",
               "dynamodb:GetItem",
+              "dynamodb:UpdateItem",
               "dynamodb:DeleteItem",
             ],
             Resource: connTableArn,
@@ -82,6 +84,19 @@ export function createLambdaRole(
         ],
       })
     ),
+  });
+
+  new aws.iam.RolePolicy("handler-transfer-bucket-policy", {
+    role: handlerRole,
+    policy: transferBucketArn.apply(bucketArn => JSON.stringify({
+      Version: "2012-10-17",
+      Statement: [{
+        Sid: "EphemeralTransferObjects",
+        Effect: "Allow",
+        Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+        Resource: `${bucketArn}/transfers/*`,
+      }],
+    })),
   });
 
   // EventBridge permissions (if event bus provided)

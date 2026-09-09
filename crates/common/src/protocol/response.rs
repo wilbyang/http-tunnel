@@ -1,3 +1,4 @@
+use super::BodyRef;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -15,7 +16,7 @@ pub struct HttpResponse {
 
     /// Response body encoded in Base64
     #[serde(default)]
-    pub body: String,
+    pub body: BodyRef,
 
     /// Processing time in milliseconds (local service response time)
     #[serde(default)]
@@ -29,7 +30,7 @@ impl HttpResponse {
             request_id,
             status_code,
             headers: HashMap::new(),
-            body: String::new(),
+            body: BodyRef::default(),
             processing_time_ms: 0,
         }
     }
@@ -101,7 +102,7 @@ mod tests {
             request_id: "req_123".to_string(),
             status_code: 200,
             headers,
-            body: "eyJ0ZXN0IjoidmFsdWUifQ==".to_string(),
+            body: BodyRef::legacy("eyJ0ZXN0IjoidmFsdWUifQ==".to_string()),
             processing_time_ms: 123,
         };
 
@@ -119,7 +120,7 @@ mod tests {
             request_id: "req_abc123".to_string(),
             status_code: 201,
             headers,
-            body: "dGVzdCBkYXRh".to_string(), // "test data"
+            body: BodyRef::legacy("dGVzdCBkYXRh".to_string()), // "test data"
             processing_time_ms: 456,
         };
 
@@ -147,7 +148,7 @@ mod tests {
             request_id: "req_123".to_string(),
             status_code: 200,
             headers,
-            body: String::new(),
+            body: BodyRef::default(),
             processing_time_ms: 0,
         };
 
@@ -167,7 +168,7 @@ mod tests {
         }"#;
 
         let parsed: HttpResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed.body, "");
+        assert!(parsed.body.is_empty());
         assert_eq!(parsed.processing_time_ms, 0);
         assert!(!parsed.has_body());
     }

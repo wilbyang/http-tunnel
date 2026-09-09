@@ -1,3 +1,4 @@
+use super::{BodyRef, UploadGrant};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -21,7 +22,11 @@ pub struct HttpRequest {
     /// Request body encoded in Base64
     /// Empty string for requests without body
     #[serde(default)]
-    pub body: String,
+    pub body: BodyRef,
+
+    /// Short-lived permission for protocol v2 forwarders to upload a large response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_upload: Option<UploadGrant>,
 
     /// Timestamp when request was received (Unix epoch in milliseconds)
     pub timestamp: u64,
@@ -35,7 +40,8 @@ impl HttpRequest {
             method,
             uri,
             headers: HashMap::new(),
-            body: String::new(),
+            body: BodyRef::default(),
+            response_upload: None,
             timestamp,
         }
     }
@@ -84,7 +90,8 @@ mod tests {
             method: "POST".to_string(),
             uri: "/api/data".to_string(),
             headers,
-            body: "eyJ0ZXN0IjoidmFsdWUifQ==".to_string(), // {"test":"value"}
+            body: BodyRef::legacy("eyJ0ZXN0IjoidmFsdWUifQ==".to_string()), // {"test":"value"}
+            response_upload: None,
             timestamp: 1234567890,
         };
 
@@ -102,7 +109,8 @@ mod tests {
             method: "GET".to_string(),
             uri: "/path?query=value".to_string(),
             headers,
-            body: String::new(),
+            body: BodyRef::default(),
+            response_upload: None,
             timestamp: 1234567890000,
         };
 
@@ -131,7 +139,8 @@ mod tests {
             method: "GET".to_string(),
             uri: "/".to_string(),
             headers,
-            body: String::new(),
+            body: BodyRef::default(),
+            response_upload: None,
             timestamp: 1234567890,
         };
 
@@ -153,7 +162,7 @@ mod tests {
         }"#;
 
         let parsed: HttpRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed.body, "");
+        assert!(parsed.body.is_empty());
         assert!(!parsed.has_body());
     }
 }

@@ -10,6 +10,9 @@ pub enum Message {
     Ping,
     Pong,
     Ready, // Sent by forwarder after connection to request connection info
+    Capabilities {
+        capabilities: Vec<String>,
+    },
 
     /// Connection lifecycle
     ConnectionEstablished {
@@ -114,7 +117,8 @@ mod tests {
             method: "GET".to_string(),
             uri: "/api/v1/users".to_string(),
             headers: HashMap::new(),
-            body: String::new(),
+            body: crate::BodyRef::default(),
+            response_upload: None,
             timestamp: 1234567890,
         };
 

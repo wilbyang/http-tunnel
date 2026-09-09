@@ -11,9 +11,11 @@
 //! through the unified `HttpApiRequest` abstraction. The response format automatically
 //! matches the request format.
 
-use http_tunnel_common::constants::MAX_BODY_SIZE_BYTES;
-use http_tunnel_common::protocol::Message;
-use http_tunnel_common::utils::generate_request_id;
+use http_tunnel_common::constants::{
+    MAX_BODY_SIZE_BYTES, MAX_WS_CONTROL_MESSAGE_BYTES, TRANSFER_URL_TTL_SECS,
+};
+use http_tunnel_common::protocol::{BodyLocation, BodyRef, Message, ObjectStore, UploadGrant};
+use http_tunnel_common::utils::{current_timestamp_secs, generate_request_id};
 use lambda_runtime::{Error, LambdaEvent};
 use tracing::{debug, error, info, warn};
 
@@ -23,6 +25,39 @@ use crate::{
     detect_routing_mode, lookup_connection_by_tunnel_id, save_pending_request, send_to_connection,
     wait_for_response,
 };
+
+async fn materialize_response_body(
+    clients: &SharedClients,
+    request_id: &str,
+    response: &mut http_tunnel_common::HttpResponse,
+) -> Result<Option<String>, Error> {
+    let BodyRef::Reference(BodyLocation::External {
+        store: ObjectStore::S3,
+        key,
+        total_bytes,
+        sha256,
+        ..
+    }) = &response.body
+    else {
+        return Ok(None);
+    };
+
+    let expected_key = crate::object_store::response_key(request_id);
+    if key != &expected_key || response.request_id != request_id {
+        return Err("Invalid external response body reference".into());
+    }
+    if *total_bytes > MAX_BODY_SIZE_BYTES as u64 {
+        return Err("External response body exceeds the configured size limit".into());
+    }
+
+    let bytes = crate::object_store::get(&clients.s3, key, *total_bytes).await?;
+    if bytes.len() as u64 != *total_bytes || crate::object_store::sha256_hex(&bytes) != *sha256 {
+        return Err("External response body failed integrity validation".into());
+    }
+
+    response.body = BodyRef::legacy(http_tunnel_common::encode_body(&bytes));
+    Ok(Some(expected_key))
+}
 
 fn strip_http_api_stage_prefix(host: &str, path: &str) -> String {
     let Some(endpoint) = std::env::var("HTTP_API_ENDPOINT").ok() else {
@@ -129,7 +164,7 @@ pub async fn handle_forwarding(
     }
 
     // Look up connection ID by tunnel ID
-    let connection_id = lookup_connection_by_tunnel_id(&clients.dynamodb, tunnel_id)
+    let connection = lookup_connection_by_tunnel_id(&clients.dynamodb, tunnel_id)
         .await
         .map_err(|e| {
             error!(
@@ -140,13 +175,51 @@ pub async fn handle_forwarding(
             "Tunnel not found or unavailable".to_string()
         })?;
 
+    let connection_id = connection.connection_id;
     debug!("Found connection: {}", connection_id);
 
     // Generate request ID
     let request_id = generate_request_id();
 
     // Build HttpRequest payload
-    let http_request = build_http_request(&request, request_id.clone());
+    let mut http_request = build_http_request(&request, request_id.clone());
+    let mut request_object_key = None;
+
+    if connection.external_body_v1 {
+        let response_key = crate::object_store::response_key(&request_id);
+        let expires_at = current_timestamp_secs() as u64 + TRANSFER_URL_TTL_SECS;
+        http_request.response_upload = Some(UploadGrant {
+            store: ObjectStore::S3,
+            key: response_key.clone(),
+            upload_url: crate::object_store::presign_put(&clients.s3, &response_key).await?,
+            expires_at,
+        });
+        if let Some(base64) = http_request.body.inline_base64().map(str::to_owned) {
+            http_request.body = BodyRef::inline(base64);
+        }
+
+        let inline_message = serde_json::to_vec(&Message::HttpRequest(http_request.clone()))?;
+        if inline_message.len() > MAX_WS_CONTROL_MESSAGE_BYTES && !http_request.body.is_empty() {
+            let base64 = http_request
+                .body
+                .inline_base64()
+                .ok_or("Expected inline request body")?;
+            let bytes = http_tunnel_common::decode_body(base64)
+                .map_err(|e| format!("Failed to decode request body: {e}"))?;
+            let key = crate::object_store::request_key(&request_id);
+            let sha256 = crate::object_store::sha256_hex(&bytes);
+            crate::object_store::put(&clients.s3, &key, bytes.clone()).await?;
+            let download_url = crate::object_store::presign_get(&clients.s3, &key).await?;
+            http_request.body = BodyRef::external(
+                key.clone(),
+                bytes.len() as u64,
+                sha256,
+                expires_at,
+                Some(download_url),
+            );
+            request_object_key = Some(key);
+        }
+    }
 
     // Store pending request in DynamoDB for response correlation
     let api_gateway_req_id = request_id_context.as_deref().unwrap_or("unknown");
@@ -170,6 +243,18 @@ pub async fn handle_forwarding(
         // Sanitized error - don't leak internal details
         "Service temporarily unavailable".to_string()
     })?;
+
+    if message_json.len() > MAX_WS_CONTROL_MESSAGE_BYTES {
+        if let Some(key) = request_object_key.as_deref() {
+            crate::object_store::delete(&clients.s3, key).await;
+        }
+        return Ok(error_response_with_headers(
+            api_version,
+            413,
+            "Request metadata is too large for the tunnel control channel",
+            &[("x-tunnel-error", "Request Entity Too Large")],
+        ));
+    }
 
     let apigw_management = clients
         .apigw_management
@@ -195,6 +280,8 @@ pub async fn handle_forwarding(
     // Poll for response with timeout
     match wait_for_response(&clients.dynamodb, &request_id).await {
         Ok(mut response) => {
+            let response_object_key =
+                materialize_response_body(clients, &request_id, &mut response).await?;
             info!(
                 "Received response for request {}: status {}",
                 request_id, response.status_code
@@ -215,8 +302,10 @@ pub async fn handle_forwarding(
 
                 let (rewritten_body, was_rewritten) = if should_rewrite {
                     // Decode body for rewriting
-                    let body_bytes = http_tunnel_common::decode_body(&response.body)
-                        .map_err(|e| format!("Failed to decode response body: {}", e))?;
+                    let body_bytes = http_tunnel_common::decode_body(
+                        response.body.inline_base64().unwrap_or_default(),
+                    )
+                    .map_err(|e| format!("Failed to decode response body: {}", e))?;
                     let body_str = String::from_utf8_lossy(&body_bytes);
 
                     // Rewrite content (default strategy: FullRewrite)
@@ -244,7 +333,8 @@ pub async fn handle_forwarding(
                     );
 
                     // Re-encode the rewritten body
-                    response.body = http_tunnel_common::encode_body(rewritten_body.as_bytes());
+                    response.body =
+                        BodyRef::legacy(http_tunnel_common::encode_body(rewritten_body.as_bytes()));
 
                     // Update Content-Length header
                     response.headers.insert(
@@ -274,9 +364,19 @@ pub async fn handle_forwarding(
             }
 
             // Convert HttpResponse to API Gateway response (matching request version)
-            Ok(build_api_gateway_response(api_version, response))
+            let result = build_api_gateway_response(api_version, response);
+            if let Some(key) = request_object_key.as_deref() {
+                crate::object_store::delete(&clients.s3, key).await;
+            }
+            if let Some(key) = response_object_key.as_deref() {
+                crate::object_store::delete(&clients.s3, key).await;
+            }
+            Ok(result)
         }
         Err(e) => {
+            if let Some(key) = request_object_key.as_deref() {
+                crate::object_store::delete(&clients.s3, key).await;
+            }
             error!("Request {} timeout or error: {}", request_id, e);
             // Return 504 Gateway Timeout
             Ok(error_response_with_headers(

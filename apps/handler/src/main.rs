@@ -10,6 +10,7 @@
 use aws_sdk_apigatewaymanagement::Client as ApiGatewayManagementClient;
 use aws_sdk_dynamodb::Client as DynamoDbClient;
 use aws_sdk_eventbridge::Client as EventBridgeClient;
+use aws_sdk_s3::Client as S3Client;
 use http_tunnel_handler::SharedClients;
 use http_tunnel_handler::handlers::{
     handle_cleanup, handle_connect, handle_disconnect, handle_forwarding, handle_response,
@@ -19,7 +20,7 @@ use http_tunnel_handler::http_api::HttpApiRequest;
 use lambda_runtime::{Error, LambdaEvent, run, service_fn};
 use rustls::crypto::{CryptoProvider, ring};
 use serde_json::Value;
-use tracing::{debug, info};
+use tracing::info;
 
 /// Event types that the unified handler can process
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,12 +107,6 @@ async fn function_handler(
         }
         EventType::WebSocketDefault => {
             // Parse as WebSocket event and handle response
-            // Log the payload for debugging
-            info!(
-                "WebSocket $default event payload: {}",
-                serde_json::to_string(&event.payload)
-                    .unwrap_or_else(|_| "failed to serialize".to_string())
-            );
             let ws_event = serde_json::from_value(event.payload)
                 .map_err(|e| format!("Failed to parse WebSocket default event: {}", e))?;
             let lambda_event = LambdaEvent::new(ws_event, event.context);
@@ -121,13 +116,6 @@ async fn function_handler(
         }
         EventType::HttpApi => {
             // Parse as HTTP API event (supports both v1 and v2 formats)
-            // Log the raw event for debugging payload format issues
-            debug!(
-                "HTTP API raw event: {}",
-                serde_json::to_string(&event.payload)
-                    .unwrap_or_else(|_| "failed to serialize".to_string())
-            );
-
             let http_request = HttpApiRequest::from_value(event.payload)
                 .map_err(|e| format!("Failed to parse HTTP API event: {}", e))?;
 
@@ -205,11 +193,13 @@ async fn main() -> Result<(), Error> {
     };
 
     let eventbridge = EventBridgeClient::new(&config);
+    let s3 = S3Client::new(&config);
 
     let clients = SharedClients {
         dynamodb,
         apigw_management,
         eventbridge,
+        s3,
     };
 
     // Run the Lambda runtime

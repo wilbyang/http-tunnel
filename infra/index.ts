@@ -7,6 +7,7 @@ import { createCustomDomains } from "./src/domain";
 import { createMonitoringDashboard, createAlarms, createBudget } from "./src/monitoring";
 import { createEventBus } from "./src/eventbridge";
 import { createStreamMapping } from "./src/streaming";
+import { createTransferBucket } from "./src/transfers";
 import { appConfig, tags } from "./src/config";
 
 // Configure AWS provider with profile from environment
@@ -22,12 +23,14 @@ const { connectionsTable, pendingRequestsTable } = createDynamoDBTables();
 
 // Step 1b: Create EventBridge event bus for event-driven responses
 const eventBus = createEventBus();
+const transferBucket = createTransferBucket();
 
 // Step 2: Create IAM role (without WebSocket API ARN policy initially)
 const handlerRole = createLambdaRole(
   connectionsTable.arn,
   pendingRequestsTable.arn,
-  eventBus.arn
+  eventBus.arn,
+  transferBucket.arn
 );
 
 // Step 3: Create WebSocket API first (without routes) to get the endpoint
@@ -70,7 +73,8 @@ const handler = createLambdaHandler(
   pendingRequestsTable.name,
   httpApi.id,
   websocketEndpoint,
-  eventBus.name
+  eventBus.name,
+  transferBucket.bucket
 );
 
 // Step 6: Add WebSocket API permissions to the IAM role
@@ -263,6 +267,7 @@ if (appConfig.enableMonitoring) {
 // Exports
 export const connectionsTableName = connectionsTable.name;
 export const pendingRequestsTableName = pendingRequestsTable.name;
+export const transferBucketName = transferBucket.bucket;
 export const websocketApiEndpoint = websocketEndpoint;
 export const httpApiEndpoint = httpEndpoint;
 export const websocketApiId = preliminaryWebsocketApi.id;
